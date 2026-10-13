@@ -31,3 +31,21 @@ presets/*
 !presets/电影.txt
 !presets/海报.txt
 !presets/巨构提示词.txt
+
+# Android build output
+android/build/
+android/app/build/
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/app/release/
+
+# Binaries fetched by CI and copied into the Android project. They are large
+# and architecture-specific, so they are rebuilt on every run instead of
+# being committed.
+android/app/src/main/jniLibs/
+android/app/src/main/assets/
+
+# Scratch directories used while assembling the APK
+rootfs/
+app-assets/

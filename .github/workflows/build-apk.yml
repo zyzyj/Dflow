@@ -1,76 +1,202 @@
 name: Build Android APK
 
+# The APK embeds a real Node.js runtime, so it is built by assembling an
+# aarch64 Alpine userland on an x86 runner (no QEMU: .apk and .tar.gz are just
+# archives, and assembling them needs no target-architecture execution).
+#
+# This replaces the earlier Capacitor workflow, which shipped only the static
+# front end. The front end is a thin client over dozens of API endpoints, so
+# without the Node process it loaded but had no gallery, no favourites and no
+# reverse-prompt queue.
+
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+
+env:
+  ALPINE_BRANCH: v3.22
+  ALPINE_VER: "3.22.6"
+  APK_TOOLS_VER: v2.14.10
 
 jobs:
   build:
-    name: Build Capacitor Android APK
+    name: Build DFlow APK (PRoot + Node)
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+      # ------------------------------------------------------------------
+      # 1. PRoot binaries, renamed for jniLibs.
+      #
+      # Android only allows exec() from the app's nativeLibraryDir, and only
+      # unpacks files named lib*.so. So the stock proot executable is renamed,
+      # together with the freestanding loader it needs to bootstrap a tracee.
+      # ------------------------------------------------------------------
+      - name: Fetch PRoot binaries
+        run: |
+          set -eux
+          out=android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$out"
+          base=https://packages.termux.dev/apt/termux-main/pool/main
+          curl -fsSLo proot.deb  "$base/p/proot/proot_5.1.107.96_aarch64.deb"
+          curl -fsSLo talloc.deb "$base/libt/libtalloc/libtalloc_2.5.0_aarch64.deb"
+          for d in proot talloc; do
+            mkdir -p "x/$d"
+            (cd "x/$d" && ar x "../../$d.deb" && tar xf data.tar.xz)
+          done
+          P=x/proot/data/data/com.termux/files/usr
+          T=x/talloc/data/data/com.termux/files/usr
+          cp "$P/bin/proot"             "$out/libproot.so"
+          cp "$P/libexec/proot/loader"  "$out/libproot-loader.so"
+          cp -L "$T/lib/libtalloc.so.2" "$out/libtalloc.so"
+          ls -l "$out"
+
+      # 16 KB page-size alignment is mandatory on Android 15+ for some devices;
+      # a 4 KB-aligned libproot.so fails to load with no useful error.
+      - name: Verify native library alignment
+        run: |
+          set -eux
+          for f in android/app/src/main/jniLibs/arm64-v8a/*.so; do
+            python3 - "$f" <<'PY'
+          import struct, sys
+          data = open(sys.argv[1], 'rb').read()
+          e_phoff = struct.unpack_from('<Q', data, 32)[0]
+          e_phentsize = struct.unpack_from('<H', data, 54)[0]
+          e_phnum = struct.unpack_from('<H', data, 56)[0]
+          aligns = {
+              struct.unpack_from('<Q', data, e_phoff + i * e_phentsize + 48)[0]
+              for i in range(e_phnum)
+              if struct.unpack_from('<I', data, e_phoff + i * e_phentsize)[0] == 1
+          }
+          assert 16384 in aligns, f"{sys.argv[1]} PT_LOAD align={aligns} (need 16384)"
+          print(f"OK  {sys.argv[1]}  aligns={sorted(aligns)}")
+          PY
+          done
+
+      # ------------------------------------------------------------------
+      # 2. Alpine rootfs with Node 22.
+      #
+      # Alpine is pinned to 3.22: 3.23+ ships apk-tools 3, which uses execveat()
+      # in a way PRoot cannot emulate, making apk unusable inside the sandbox.
+      # ------------------------------------------------------------------
+      - name: Build Alpine rootfs
+        run: |
+          set -eux
+          curl -fsSLo apk.static \
+            "https://gitlab.alpinelinux.org/api/v4/projects/5/packages/generic/$APK_TOOLS_VER/x86_64/apk.static"
+          chmod +x apk.static
+          curl -fsSLo mini.tar.gz \
+            "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/releases/aarch64/alpine-minirootfs-$ALPINE_VER-aarch64.tar.gz"
+          mkdir -p rootfs
+          sudo tar -xzf mini.tar.gz -C rootfs
+
+          # npm lives in community, nodejs in main: both must be configured or
+          # apk cannot resolve npm's dependencies.
+          printf '%s\n' \
+            "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/main" \
+            "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/community" \
+            | sudo tee rootfs/etc/apk/repositories > /dev/null
+
+          sudo ./apk.static --arch aarch64 --root rootfs --no-scripts --initdb \
+            -X "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/main" \
+            -X "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/community" \
+            --allow-untrusted add nodejs ca-certificates tzdata
+
+          # Mark complete only when the extraction above succeeded, so a partial
+          # tree is never mistaken for a valid one at runtime.
+          sudo touch rootfs/.complete
+          sudo du -sh rootfs
+          mkdir -p app-assets
+          sudo tar -czf app-assets/rootfs.tar.gz -C rootfs .
+          sudo chown "$(id -u):$(id -g)" app-assets/rootfs.tar.gz
+          ls -lh app-assets/
+
+      # ------------------------------------------------------------------
+      # 3. DFlow application files plus dependencies for musl/arm64.
+      #
+      # npm resolves optional native packages per-platform, so asking it for
+      # linux/arm64/musl from an x86 runner yields the correct sharp binaries
+      # without running anything.
+      # ------------------------------------------------------------------
+      - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '22'
           cache: 'npm'
 
-      - name: Setup Java JDK 21
-        uses: actions/setup-java@v4
+      - name: Install production dependencies for linux/arm64/musl
+        run: |
+          set -eux
+          npm ci --omit=dev --include=optional \
+                  --os=linux --cpu=arm64 --libc=musl --ignore-scripts
+          # Verify the native pieces that the app cannot run without.
+          test -d node_modules/sharp || { echo "sharp missing"; exit 1; }
+          ls node_modules/@img/ | grep -q arm64 || { echo "sharp arm64 binary missing"; exit 1; }
+          du -sh node_modules
+
+      - name: Package application tree
+        run: |
+          set -eux
+          mkdir -p app-assets
+          # Ship only what the server needs at runtime. The Android project and
+          # the test suite would add tens of MB for no benefit.
+          mkdir -p app/app
+          for item in server.js mcp-server.js metadata.js network.js \
+                      presets.js reverse-workflow.js thumbnails.js auth.js \
+                      dsh-bridge.js browser-login.js package.json; do
+            if [ -e "$item" ]; then cp -r "$item" app/app/; fi
+          done
+          for dir in public presets scripts; do
+            if [ -d "$dir" ]; then cp -r "$dir" app/app/; fi
+          done
+          cp -r node_modules app/app/node_modules
+          du -sh app/app
+          tar -czf app-assets/app.tar.gz -C app app
+          ls -lh app-assets/
+
+      - name: Attach assets to the Android project
+        run: |
+          set -eux
+          mkdir -p android/app/src/main/assets
+          mv app-assets/rootfs.tar.gz android/app/src/main/assets/
+          mv app-assets/app.tar.gz android/app/src/main/assets/
+          ls -lh android/app/src/main/assets/
+
+      # ------------------------------------------------------------------
+      # 4. Build.
+      # ------------------------------------------------------------------
+      - uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
-          java-version: '21'
+          distribution: 'temurin'
+          java-version: '17'
 
-      - name: Accept Android SDK licenses
+      - uses: android-actions/setup-android@v3
+
+      - name: Build debug APK
         run: |
-          yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
-
-      - name: Install dependencies & setup Capacitor
-        run: |
-          npm install
-          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
-          
-          # no-referrer
-          if ! grep -q 'name="referrer"' public/index.html; then
-            sed -i 's/<head>/<head>\n  <meta name="referrer" content="no-referrer">/' public/index.html
-          fi
-
-          cat << 'EOF' > capacitor.config.json
-          {
-            "appId": "com.oldiron.dflow",
-            "appName": "DFlow",
-            "webDir": "public",
-            "server": {
-              "androidScheme": "https",
-              "cleartext": true
-            }
-          }
-          EOF
-
-
-          npx cap add android
-          npx cap sync android
-
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$MANIFEST"
-          fi
-
-      - name: Build Android Debug APK
-        run: |
+          set -eux
           cd android
-          chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Upload Debug APK
+      - name: Report APK size
+        run: |
+          set -eux
+          apk=$(find android/app/build/outputs/apk -name '*.apk' | head -1)
+          ls -lh "$apk"
+          # A Capacitor shell of this app was ~3.8 MB. Anything near that means
+          # the rootfs or node_modules silently failed to get packaged.
+          size=$(stat -c %s "$apk")
+          if [ "$size" -lt 20000000 ]; then
+            echo "::error::APK is only $size bytes; the embedded runtime is missing"
+            exit 1
+          fi
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: DFlow-Android-Debug-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: DFlow-APK
+          path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error

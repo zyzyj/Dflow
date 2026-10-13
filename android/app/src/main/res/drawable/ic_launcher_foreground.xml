@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Simple "D" mark; avoids shipping a bitmap for a launcher the user will replace anyway. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#5B8DEF"
+        android:pathData="M36,30h14c13,0 22,9 22,24s-9,24 -22,24h-14zM44,38v32h6c8,0 13,-6 13,-16s-5,-16 -13,-16z" />
+</vector>
