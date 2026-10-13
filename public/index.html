@@ -129,6 +129,7 @@
       <button type="button" class="settings-tab active" data-tab="tabDanbooru">Danbooru 账号</button>
       <button type="button" class="settings-tab" data-tab="tabPixiv">Pixiv 登录</button>
       <button type="button" class="settings-tab" data-tab="tabTranslate">翻译引擎配置</button>
+      <button type="button" class="settings-tab" data-tab="tabNetwork">网络代理</button>
       <button type="button" class="settings-tab" data-tab="tabMcp">MCP 设置</button>
     </div>
     <button type="button" id="closeSettingsHeader" class="dialog-close-btn" aria-label="关闭">×</button>
@@ -226,6 +227,18 @@
         <button type="button" id="testTranslate" class="btn-subtle">测试翻译连通性</button>
         <span id="translateStatus" class="status-inline"></span>
       </div>
+    </div>
+    <!-- Tab 4: Network proxy -->
+    <div id="tabNetwork" class="settings-panel">
+      <p class="settings-desc">DFlow 服务端自己发起对画站的请求（包括图片代理），所以需要在这里配置代理，而不是只给浏览器挂代理。留空表示直连。</p>
+      <label>代理地址<input id="proxyUrl" autocomplete="off" placeholder="例如：127.0.0.1:7890 或 http://192.168.1.2:7890"></label>
+      <small class="settings-tip">支持 http / https 代理。可省略 <code>http://</code> 前缀。目前不支持 socks5（Node 侧需要额外依赖）。本机回环请求（MCP、本地 API）不会走代理。</small>
+      <div class="settings-inline-actions" style="margin-top:12px;">
+        <button type="button" id="testNetwork" class="btn-subtle">测试画站连通性</button>
+        <span id="networkStatus" class="status-inline"></span>
+      </div>
+      <div id="networkResults" class="network-results" hidden></div>
+      <p class="settings-desc" style="margin-top:16px;">当前生效的代理：<code id="activeProxyValue">（读取中）</code></p>
     </div>
     <div id="tabMcp" class="settings-panel">
       <p class="settings-desc">本机 stdio MCP · 两阶段流程：先反推，再扩写。连接配置只供本机 Agent 使用；预设存放在本地独立文件夹。</p>

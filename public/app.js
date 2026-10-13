@@ -3772,6 +3772,8 @@ document.querySelector('#settings').onclick = () => {
   document.querySelector('#volcAccessKey').value = localStorage.volcAccessKey || '';
   document.querySelector('#volcSecretKey').value = localStorage.volcSecretKey || '';
   document.querySelector('#googleTranslateKey').value = localStorage.googleTranslateKey || '';
+  document.querySelector('#proxyUrl').value = localStorage.proxyUrl || '';
+  refreshNetworkStatus();
 
   const targetTab = station === 'pflow' ? 'tabPixiv' : 'tabDanbooru';
   document.querySelectorAll('.settings-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === targetTab));
@@ -3831,6 +3833,59 @@ document.querySelector('#testTranslate').onclick = async () => {
   }
 };
 
+// Show which proxy the server is actually using, not what the input box says.
+async function refreshNetworkStatus() {
+  const el = document.querySelector('#activeProxyValue');
+  if (!el) return;
+  try {
+    const response = await fetch('/api/network/test?timeout=1');
+    const data = await response.json();
+    el.textContent = data.explicit
+      ? (data.proxy || '（已设置但解析无效）')
+      : (data.proxy ? `${data.proxy}（来自环境变量）` : '未设置（直连）');
+  } catch { el.textContent = '（读取失败）'; }
+}
+
+document.querySelector('#testNetwork').onclick = async () => {
+  const status = document.querySelector('#networkStatus');
+  const box = document.querySelector('#networkResults');
+  status.textContent = '正在测试…'; status.className = 'status-inline';
+  box.hidden = true; box.replaceChildren();
+  try {
+    // Save first: the test must exercise the proxy the user typed, and saving is
+    // what makes the server install it on its dispatcher.
+    await fetch('/api/account', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proxyUrl: document.querySelector('#proxyUrl').value.trim() })
+    });
+    localStorage.proxyUrl = document.querySelector('#proxyUrl').value.trim();
+    const response = await fetch('/api/network/test');
+    const data = await response.json();
+    const reachable = data.results.filter(item => item.ok);
+    status.textContent = reachable.length
+      ? `✓ 可访问 ${reachable.length}/${data.results.length} 个站点`
+      : '✕ 全部不可达，请检查代理地址';
+    status.className = `status-inline ${reachable.length ? 'status-success' : 'status-error'}`;
+    box.hidden = false;
+    for (const item of data.results) {
+      const row = document.createElement('div');
+      row.className = 'network-result-row';
+      const detail = item.ok ? `HTTP ${item.status}` : (item.error || `HTTP ${item.status}`);
+      row.textContent = `${item.ok ? '✓' : '✕'} ${item.name} — ${detail}（${item.ms}ms）`;
+      box.append(row);
+    }
+    const proxyRow = document.createElement('div');
+    proxyRow.className = 'network-result-row';
+    proxyRow.textContent = `当前生效代理：${data.proxy || '无（直连）'}`;
+    box.append(proxyRow);
+    refreshNetworkStatus();
+  } catch (error) {
+    status.textContent = `✕ 测试失败: ${error.message}`;
+    status.className = 'status-inline status-error';
+  }
+};
+
 document.querySelector('#saveSettings').onclick = async () => {
   const payload = {
     loginName: document.querySelector('#loginName').value.trim(),
@@ -3844,7 +3899,8 @@ document.querySelector('#saveSettings').onclick = async () => {
     tencentSecretKey: document.querySelector('#tencentSecretKey').value.trim(),
     volcAccessKey: document.querySelector('#volcAccessKey').value.trim(),
     volcSecretKey: document.querySelector('#volcSecretKey').value.trim(),
-    googleTranslateKey: document.querySelector('#googleTranslateKey').value.trim()
+    googleTranslateKey: document.querySelector('#googleTranslateKey').value.trim(),
+    proxyUrl: document.querySelector('#proxyUrl').value.trim()
   };
 
   localStorage.loginName = payload.loginName;
@@ -3859,6 +3915,7 @@ document.querySelector('#saveSettings').onclick = async () => {
   localStorage.volcAccessKey = payload.volcAccessKey;
   localStorage.volcSecretKey = payload.volcSecretKey;
   localStorage.googleTranslateKey = payload.googleTranslateKey;
+  localStorage.proxyUrl = payload.proxyUrl;
 
   try {
     const response = await fetch('/api/account', {
@@ -4044,6 +4101,13 @@ async function initializeSharedState() {
       if (remote.account.volcAccessKey) localStorage.volcAccessKey = remote.account.volcAccessKey;
       if (remote.account.volcSecretKey) localStorage.volcSecretKey = remote.account.volcSecretKey;
       if (remote.account.googleTranslateKey) localStorage.googleTranslateKey = remote.account.googleTranslateKey;
+      // Assign unconditionally: a proxy cleared on another device must also
+      // clear here, so an `if (value)` guard would leave a stale proxy behind.
+      if (remote.account.proxyUrl !== undefined && remote.account.proxyUrl !== localStorage.proxyUrl) {
+        localStorage.proxyUrl = remote.account.proxyUrl;
+        const input = document.querySelector('#proxyUrl');
+        if (input) input.value = remote.account.proxyUrl;
+      }
     }
     applyPreferences(remote.updatedAt ? remote.preferences : localPreferences);
   } catch {

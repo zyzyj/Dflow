@@ -2426,6 +2426,23 @@ dialog.settings-modal::backdrop {
 .status-inline.status-success { color: #34d399; }
 .status-inline.status-error { color: #f87171; }
 
+/* Network proxy tab: one line per probed site, monospace so HTTP codes align. */
+.network-results {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.network-result-row {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow-x: auto;
+}
+
 .dialog-actions {
   display: flex;
   justify-content: flex-end;

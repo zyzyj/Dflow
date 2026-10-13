@@ -1,5 +1,5 @@
 import { createThumbnailCache, sendLocalImage } from './thumbnails.js';
-import { configureNetwork } from './network.js';
+import { configureNetwork, applyProxy, activeProxy } from './network.js';
 import { danbooruCredentials, normalizePixivCookie, authFailure } from './auth.js';
 import { PixivBrowserLogin } from './browser-login.js';
 import express from "express";
@@ -420,7 +420,11 @@ const defaultSharedState = () => ({
     translateFallback: true,
     deeplKey: "",
     tencentSecretId: "", tencentSecretKey: "",
-    volcAccessKey: "", volcSecretKey: ""
+    volcAccessKey: "", volcSecretKey: "",
+    // Proxy for reaching Danbooru / Pixiv.  Empty means "no proxy".  Persisted
+    // here so the setting survives restarts and is applied before the first
+    // outbound request; see the applyProxy call right after readSharedState().
+    proxyUrl: ""
   },
   favorites: [],
   preferences: { mode: "latest", columns: 5, ratings: ["g", "s", "q", "e"], pixivRating: "safe", pixivDates: {}, search: "", selectedTags: [] },
@@ -441,6 +445,10 @@ function readSharedState() {
 }
 let sharedState = readSharedState();
 sharedState.account.pixivCookie=normalizePixivCookie(sharedState.account.pixivCookie);
+// The saved proxy must be in effect before any outbound request.  This runs
+// after the state file is read (configureNetwork at the top of the file cannot
+// see it yet) and overrides any environment-derived proxy.
+applyProxy(sharedState.account.proxyUrl);
 const pixivLogin = new PixivBrowserLogin(DATA_DIR,(cookie) => {
   sharedState.account.pixivCookie=cookie;
   writeSharedState();
@@ -905,10 +913,13 @@ app.put("/api/account", (req, res) => {
     tencentSecretId: String(body.tencentSecretId ?? sharedState.account.tencentSecretId ?? "").trim(),
     tencentSecretKey: String(body.tencentSecretKey ?? sharedState.account.tencentSecretKey ?? "").trim(),
     volcAccessKey: String(body.volcAccessKey ?? sharedState.account.volcAccessKey ?? "").trim(),
-    volcSecretKey: String(body.volcSecretKey ?? sharedState.account.volcSecretKey ?? "").trim()
+    volcSecretKey: String(body.volcSecretKey ?? sharedState.account.volcSecretKey ?? "").trim(),
+    proxyUrl: String(body.proxyUrl ?? sharedState.account.proxyUrl ?? "").trim()
   };
   writeSharedState();
-  res.json({ ok: true, account: sharedState.account, updatedAt: sharedState.updatedAt });
+  // A changed proxy takes effect immediately, without a service restart.
+  applyProxy(sharedState.account.proxyUrl);
+  res.json({ ok: true, account: sharedState.account, activeProxy, updatedAt: sharedState.updatedAt });
 });
 app.put("/api/preferences", (req, res) => {
   const allowedModes = new Set([
@@ -1839,6 +1850,31 @@ async function testDanbooruAuth(req,res) {
   }catch(error){return res.status(502).json({ok:false,message:'无法连接 Danbooru：请检查代理是否覆盖 Node.js、DNS、证书或网络超时。这不代表凭据错误。',code:error.cause?.code || error.code || error.name});}
 }
 app.get('/api/auth-test',testDanbooruAuth); // backward-compatible with older clients
+// Probe outbound connectivity so the user can tell a wrong proxy (or a blocked
+// network) apart from wrong credentials.  Reports the proxy actually in use,
+// derived from the live dispatcher rather than from the saved settings alone,
+// so the answer cannot disagree with what requests really do.
+const NETWORK_PROBES = [
+  { name: 'Danbooru', url: 'https://danbooru.donmai.us/posts.json?limit=1' },
+  { name: 'Pixiv', url: 'https://www.pixiv.net/' },
+  { name: 'GitHub', url: 'https://api.github.com/' }
+];
+app.get('/api/network/test', async (req, res) => {
+  const started = Date.now();
+  const results = await Promise.all(NETWORK_PROBES.map(async probe => {
+    const at = Date.now();
+    try {
+      const response = await fetch(probe.url, {
+        headers: { 'User-Agent': 'DFlow/0.1', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(Number(req.query.timeout) || 12000)
+      });
+      return { name: probe.name, ok: response.ok, status: response.status, ms: Date.now() - at };
+    } catch (error) {
+      return { name: probe.name, ok: false, error: error.cause?.code || error.code || error.message, ms: Date.now() - at };
+    }
+  }));
+  res.json({ ok: results.some(item => item.ok), proxy: activeProxy, explicit: Boolean(sharedState.account.proxyUrl), results, ms: Date.now() - started });
+});
 app.post('/api/auth-test',testDanbooruAuth);
 app.get("/api/posts", async (req, res) => {
   const upstream = new URL("/posts.json", DANBOORU);
