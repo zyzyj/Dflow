@@ -303,7 +303,18 @@ data class ApiAccess(
     val endpoints: List<ApiEndpoint> = emptyList(),
     val headerName: String = "X-DFlow-Token",
     val note: String = "",
-)
+    /**
+     * The address the server is actually listening on ("127.0.0.1" or "0.0.0.0").
+     *
+     * Authoritative, unlike inferring the scope from [endpoints]: that list is
+     * built from the device's interfaces, so it contains a LAN entry whenever a
+     * Wi-Fi address exists — even when the service is bound to loopback only.
+     */
+    val boundHost: String = "",
+) {
+    /** True when the service accepts connections from other devices. */
+    val listensOnLan: Boolean get() = boundHost == "0.0.0.0" || boundHost == "::"
+}
 
 @Serializable
 data class ApiEndpoint(val host: String = "", val url: String = "", val scope: String = "")

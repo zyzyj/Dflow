@@ -148,14 +148,28 @@ export function createMcpHandler({ json, raw, version, getConfig }) {
  * Explains how to connect, so a user can copy a working configuration instead of
  * guessing at headers.
  */
-export function connectionInfo({ addresses, port, requireToken, token, enabled }) {
+export function connectionInfo({ addresses, port, requireToken, token, enabled, boundHost = '' }) {
   const hosts = addresses?.length ? addresses : ['127.0.0.1'];
+  // Only advertise addresses that the service can actually accept connections on.
+  //
+  // This list used to be every non-loopback address on the device, regardless of
+  // the bind scope, so with the service on loopback the screen still told the
+  // user to configure a LAN URL — which then silently refused connections. When
+  // the service is loopback-only, only the loopback URL is offered.
+  const listensOnLan = boundHost === '0.0.0.0' || boundHost === '::';
+  const endpointHosts = listensOnLan
+    ? [...hosts, '127.0.0.1']
+    : ['127.0.0.1'];
   return {
     enabled,
     requireToken,
     // Echoed only when a token is required; otherwise there is nothing to copy.
     token: requireToken ? token : '',
-    endpoints: hosts.map(host => ({
+    // The address the server is bound to, so the UI can state the real scope
+    // instead of inferring it.
+    boundHost,
+    listensOnLan,
+    endpoints: endpointHosts.map(host => ({
       host,
       url: `http://${host}:${port}/mcp`,
       scope: host === '127.0.0.1' ? 'shutdown' : 'lan',
@@ -165,13 +179,15 @@ export function connectionInfo({ addresses, port, requireToken, token, enabled }
       mcpServers: {
         'dflow-http': {
           type: 'http',
-          url: `http://${hosts[0]}:${port}/mcp`,
+          url: `http://${endpointHosts[0]}:${port}/mcp`,
           ...(requireToken ? { headers: { 'X-DFlow-Token': token || '<令牌>' } } : {}),
         },
       },
     },
-    note: requireToken
-      ? '调用时需带上 X-DFlow-Token 请求头（或 Authorization: Bearer <令牌>）。'
-      : '当前未启用令牌：同一网络内的任何设备都能读取你的收藏图片与提示词。',
+    note: !listensOnLan
+      ? '当前只监听本机，其他设备无法连接；要供其他设备调用，请把监听范围切到局域网。'
+      : requireToken
+        ? '调用时需带上 X-DFlow-Token 请求头（或 Authorization: Bearer <令牌>）。'
+        : '当前未启用令牌：同一网络内的任何设备都能读取你的收藏图片与提示词。',
   };
 }

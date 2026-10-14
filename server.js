@@ -3286,6 +3286,13 @@ app.get('/api/api-access', (req, res) => {
       requireToken: sharedState.account.apiRequireToken !== false,
       token: String(sharedState.account.apiToken || ''),
       enabled: Boolean(sharedState.account.apiEnabled),
+      // Report the address actually bound, not merely which addresses exist.
+      // The UI previously inferred the scope from the presence of a LAN entry,
+      // but that list comes from the device's interfaces and says nothing about
+      // what the server listens on — so the screen could claim "lan" while the
+      // service was bound to loopback, and the address it told the user to
+      // configure would not accept connections.
+      boundHost: HOST,
     }),
   });
 });

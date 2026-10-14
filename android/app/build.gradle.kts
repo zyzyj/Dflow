@@ -13,8 +13,8 @@ android {
         applicationId = "com.zyzyj.dflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.4.1-test4"
+        versionCode = 11
+        versionName = "0.4.2-test1"
 
         // The APK ships a self-contained Linux userland (proot + Alpine rootfs +
         // node_modules), so it only makes sense on 64-bit ARM. Shipping other

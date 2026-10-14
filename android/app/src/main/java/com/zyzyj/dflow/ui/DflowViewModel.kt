@@ -650,12 +650,51 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
                         endpoints = info.endpoints,
                         headerName = info.headerName,
                         note = info.note,
-                        bindScope = if (it.bindScope == "local" && info.endpoints.any { e -> e.scope == "lan" }) "lan" else it.bindScope,
+                        // Taken from the server's actual bind address. This used
+                        // to be inferred from whether the endpoint list contained
+                        // a LAN entry, which is always true on a phone with Wi-Fi
+                        // — so the screen could show "局域网時 while the service was
+                        // still on loopback, and the address it told the user to
+                        // use would refuse connections.
+                        bindScope = if (info.listensOnLan) "lan" else "local",
                     )
                 }
             } catch (e: DflowApi.ApiException) {
                 _apiAccess.update { it.copy(loading = false, error = e.message) }
             }
+        }
+    }
+
+    /**
+     * Records the requested bind scope and restarts the embedded service.
+     *
+     * The scope is read before the guest starts, so it cannot apply live; the
+     * state is refreshed immediately afterwards so the screen shows the requested
+     * value rather than the value that was in effect before the restart.
+     */
+    fun setBindScope(scope: String, onRestart: () -> Unit) {
+        _apiAccess.update { it.copy(bindScope = scope, savedAt = System.currentTimeMillis()) }
+        onRestart()
+        // The server needs a few seconds to come back; poll instead of assuming.
+        viewModelScope.launch {
+            repeat(20) {
+                kotlinx.coroutines.delay(1500)
+                val info = runCatching { api.apiAccess() }.getOrNull()
+                if (info != null && (info.listensOnLan == (scope == "lan"))) {
+                    loadApiAccess()
+                    _settings.update {
+                        it.copy(
+                            message = if (scope == "lan") "已切换到局域网，其他设备可以连接"
+                            else "已切换到仅本机",
+                            messageIsError = false,
+                        )
+                    }
+                    return@launch
+                }
+            }
+            // Still report the requested value; the probe may simply be hitting a
+            // service that is not up yet, which the status banner already shows.
+            loadApiAccess()
         }
     }
 

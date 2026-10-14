@@ -115,6 +115,29 @@ def main():
     check('含 mcp 端点', any('/mcp' in e['url'] for e in info.get('endpoints', [])))
     check('含客户端配置示例', 'mcpServers' in info.get('clientConfig', {}))
 
+    # 关键：报告的监听范围必须是真实绑定地址推导的，不能从「接口里有局域网
+    # 地址」推测——那在手机连了 Wi-Fi 时永远为真，会让界面谎报已开放，
+    # 而用户照着配置的地址根本连不上。
+    bound = info.get('boundHost')
+    check('如实报告绑定地址', bound in ('127.0.0.1', '0.0.0.0'), repr(bound))
+    listens_lan = info.get('listensOnLan')
+    check('listensOnLan 与绑定地址一致',
+          listens_lan == (bound in ('0.0.0.0', '::')),
+          f'boundHost={bound} listensOnLan={listens_lan}')
+
+    # 只监听本机时，不应列出无法连接的局域网地址。
+    lan_eps = [e for e in info.get('endpoints', []) if e.get('scope') == 'lan']
+    if bound == '127.0.0.1':
+        check('仅本机时不列出局域网地址（否则是误导）', not lan_eps,
+              str([e['url'] for e in lan_eps]))
+        cfg_url = info.get('clientConfig', {}).get('mcpServers', {}).get('dflow-http', {}).get('url', '')
+        check('仅本机时 clientConfig 指向 loopback', '127.0.0.1' in cfg_url, cfg_url)
+        check('提示说明其他设备无法连接', '无法连接' in info.get('note', ''),
+              info.get('note', '')[:40])
+    else:
+        check('局域网模式下列出局域网地址', bool(lan_eps),
+              str([e['url'] for e in info.get('endpoints', [])]))
+
     print("=== 9. 关闭后立即失效 ===")
     call('PUT', '/api/account', {'apiEnabled': False})
     status, body = rpc(token, 'initialize', {

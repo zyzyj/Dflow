@@ -292,8 +292,9 @@ fun DflowApp(viewModel: DflowViewModel) {
                             // The guest reads the bind address before it starts, so the
                             // change only takes effect on a fresh launch. Restarting via
                             // one action avoids a stop/start race that could leave no
-                            // server running.
-                            NodeService.restart(context)
+                            // server running; the view model then polls until the
+                            // service reports the new scope.
+                            viewModel.setBindScope(bindScope) { NodeService.restart(context) }
                             scope.launch { snackbar.showSnackbar("已切换监听范围，正在重启服务…") }
                         },
                     )
