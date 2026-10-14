@@ -43,6 +43,9 @@ DFLOW_E2E_PORT=4199 DFLOW_DATA_DIR="$DATA" python3 android/tools/e2e-bulk.py
 echo "--- MCP over HTTP（本机认证与工具）---"
 DFLOW_E2E_PORT=4199 DFLOW_DATA_DIR="$DATA" python3 android/tools/e2e-api.py
 
+echo "--- reverse_image 两种模式 ---"
+DFLOW_E2E_PORT=4199 DFLOW_DATA_DIR="$DATA" python3 android/tools/e2e-reverse-image.py
+
 echo "--- 版本比较（纯函数）---"
 node android/tools/test-version.mjs
 

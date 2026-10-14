@@ -401,8 +401,9 @@ export function registerTools(server, context) {
 
       const capability = await json('/api/ai/capability');
       if (capability.configured && context.reverse) {
-        // Write the image to a temporary file inside the data directory; the
-        // built-in reverse path reads from disk and enforces its own limits.
+        // Runs the caller's image through the configured model. Note this spends
+        // the owner's API quota, which is why remote access is opt-in and the
+        // settings screen says so.
         const result = await context.reverse({
           bytes: image.bytes,
           mimeType: image.type,

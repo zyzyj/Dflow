@@ -242,8 +242,8 @@ fun ApiScreen(
                 "可用工具包括：list_prompts（列出已反推的提示词）、get_prompt（按 id 取提示词）、"
                     + "get_image（取回原图）、reverse_image（图片反推提示词）、list_pending、"
                     + "complete_pending 等，与电脑上的 MCP 完全一致。\n\n"
-                    + "reverse_image 需要 DFlow 已配置视觉模型；未配置时会返回图片与反推说明，"
-                    + "由调用方自己的模型识别。"
+                    + "注意：reverse_image 在已配置视觉模型时会用你的 API 去识别图片，会产生费用。"
+                    + "未配置模型时不会产生任何费用——它会返回图片与反推说明，由调用方自己的模型完成。"
             )
         }
 
