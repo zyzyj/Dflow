@@ -137,14 +137,17 @@ jobs:
           # Verify the native pieces that the app cannot run without.
           test -d node_modules/sharp || { echo "sharp missing"; exit 1; }
           ls node_modules/@img/ | grep -q arm64 || { echo "sharp arm64 binary missing"; exit 1; }
+
+          # playwright-core drives the desktop Pixiv login (it launches Chrome).
+          # There is no Chrome inside PRoot, so it can never work on the phone and
+          # only inflates the APK. DFlow degrades to pasting a cookie by hand.
+          rm -rf node_modules/playwright-core
           du -sh node_modules
 
       - name: Package application tree
         run: |
           set -eux
           mkdir -p app-assets
-          # Ship only what the server needs at runtime. The Android project and
-          # the test suite would add tens of MB for no benefit.
           mkdir -p app/app
           for item in server.js mcp-server.js metadata.js network.js \
                       presets.js reverse-workflow.js thumbnails.js auth.js \
@@ -158,6 +161,14 @@ jobs:
           du -sh app/app
           tar -czf app-assets/app.tar.gz -C app app
           ls -lh app-assets/
+
+      # Unpacking runs on the phone, where a failure costs a full rebuild-and-
+      # install cycle to diagnose. This verifies both archives here instead:
+      # path-traversal entries must be rejected, and nothing legitimate may be.
+      - name: Verify archives unpack cleanly
+        run: |
+          set -eux
+          python3 android/tools/verify-tar.py app-assets/rootfs.tar.gz app-assets/app.tar.gz
 
       - name: Attach assets to the Android project
         run: |
@@ -237,11 +248,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
-          tag="apk-$(date -u +%Y%m%d-%H%M%S)"
+          tag="test-$(date -u +%Y%m%d-%H%M%S)"
           apk=$(find android/app/build/outputs/apk/debug -name '*.apk' | head -1)
-          notes=$'自动构建的调试包。\n\n内含 PRoot + Alpine + Node 22 与预装的 node_modules，\n因此体积约 50 MB 属正常（纯静态的壳是 3.8 MB）。'
+          notes=$'⚠️ 测试包（debug），不是正式版。\n\n包名 com.zyzyj.dflow.debug，可与正式版共存，不会覆盖数据。\n内含 PRoot + Alpine + Node 22 与预装的 node_modules，\n体积约 100+ MB 属正常（纯静态的壳只有 3.8 MB）。\n\n首次启动会在应用内解压约 140 MB，需要一二十秒。'
           gh release create "$tag" "$apk" \
-            --title "DFlow APK $tag" \
+            --title "DFlow 测试包 $tag" \
             --notes "$notes" \
             --prerelease
-          echo "已发布：$tag"
+          echo "已发布测试包：$tag"

@@ -69,6 +69,8 @@ object TarExtractor {
 
         val header = ByteArray(BLOCK)
         var extractedBytes = 0L
+        // Set by a GNU 'L' entry to carry the real name for the member after it.
+        var pendingLongName: String? = null
 
         while (true) {
             if (!readFully(input, header)) break
@@ -83,15 +85,31 @@ object TarExtractor {
             if (name.isEmpty()) break
 
             val prefix = readString(header, 345, 155)
-            val fullName = if (prefix.isEmpty()) name else "$prefix/$name"
-
-            val size = readOctal(header, 124, 12)
-            // typeflag at offset 156; '\0' and '0' both mean a regular file
             val typeFlag = header[156].toInt().toChar()
+            val size = readOctal(header, 124, 12)
+            val sizeInBlocks = ((size + BLOCK - 1) / BLOCK) * BLOCK
+
+            // GNU long-name entry: it carries the real (over 100 char) path for
+            // the *next* member. Without this the long path would be truncated
+            // to 100 bytes and files would land at wrong names. Emitted by tar
+            // for deep node_modules paths.
+            if (typeFlag == 'L') {
+                val longName = readFixedSizeString(input, size)
+                skipFully(input, sizeInBlocks - size)
+                pendingLongName = longName
+                continue
+            }
+            if (typeFlag == 'K') { // long link target; not used by our archives
+                skipFully(input, sizeInBlocks)
+                continue
+            }
+
+            val effectiveName = pendingLongName?.also { pendingLongName = null } ?: name
+            val fullName = if (prefix.isEmpty()) effectiveName else "$prefix/$effectiveName"
+
             val linkName = readString(header, 157, 100)
             val mode = readOctal(header, 100, 8)
 
-            val sizeInBlocks = ((size + BLOCK - 1) / BLOCK) * BLOCK
             val target = safeResolve(destCanonical, fullName)
                 ?: throw IOException("Unsafe path in archive: $fullName")
 
@@ -159,10 +177,15 @@ object TarExtractor {
     /**
      * Resolves [entryName] under [root], returning null if the result would
      * land outside the root. Guards against `..` traversal and absolute paths.
+     *
+     * An entry that names the root itself (`.`, `./`) is legitimate — GNU tar
+     * emits `./` as the first member of an archive built with `tar -C dir .` —
+     * so it resolves to [root] rather than being rejected.
      */
     private fun safeResolve(root: File, entryName: String): File? {
-        val cleaned = entryName.trimStart('/').removePrefix("./")
-        if (cleaned.isEmpty()) return null
+        val cleaned = entryName.trimStart('/').removePrefix("./").trimEnd('/')
+        // Root itself: nothing to create, but not an attack either.
+        if (cleaned.isEmpty() || cleaned == ".") return root
         val candidate = File(root, cleaned).canonicalFile
         val rootPath = root.path + File.separator
         return if (candidate.path == root.path || candidate.path.startsWith(rootPath)) candidate else null
@@ -193,6 +216,21 @@ object TarExtractor {
         val resolved = File(linkLocation.parentFile, linkName).canonicalFile
         val rootPath = root.path + File.separator
         return if (resolved.path.startsWith(rootPath)) linkName else null
+    }
+
+    /** Reads a NUL-terminated string of exactly [length] bytes, without padding trims. */
+    private fun readFixedSizeString(input: InputStream, length: Long): String {
+        if (length <= 0) return ""
+        val bytes = ByteArray(length.toInt())
+        var read = 0
+        while (read < bytes.size) {
+            val count = input.read(bytes, read, bytes.size - read)
+            if (count < 0) break
+            read += count
+        }
+        var end = 0
+        while (end < bytes.size && bytes[end] != 0.toByte()) end++
+        return String(bytes, 0, end, StandardCharsets.UTF_8)
     }
 
     private fun readString(buffer: ByteArray, offset: Int, length: Int): String {

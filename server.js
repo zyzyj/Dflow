@@ -455,7 +455,10 @@ const pixivLogin = new PixivBrowserLogin(DATA_DIR,(cookie) => {
 });
 app.post('/api/pixiv/login', async(req,res)=>{
   if(!localRequest(req))return res.status(403).json({error:'请在运行 DFlow 的电脑上打开官方登录；局域网设备仍可使用手动 Cookie'});
-  try {res.json(await pixivLogin.start());}catch(error){res.status(503).json({error:'无法打开官方登录窗口，请检查 Chrome/Edge 或改用手动 Cookie。', detail:pixivLogin.status().message});}
+  // Report the real reason from the thrown error: on the Android build the cause
+  // is a missing browser component, not a missing Chrome installation, and the
+  // generic message would send the user looking for the wrong fix.
+  try {res.json(await pixivLogin.start());}catch(error){res.status(503).json({error:'无法打开官方登录窗口，请检查 Chrome/Edge 或改用手动 Cookie。', detail:error?.message || pixivLogin.status().message});}
 });
 app.get('/api/pixiv/login',(_req,res)=>res.json(pixivLogin.status()));
 app.delete('/api/pixiv/login',async(req,res)=>{if(!localRequest(req))return res.sendStatus(403);res.json(await pixivLogin.cancel());});

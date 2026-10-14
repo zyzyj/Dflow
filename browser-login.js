@@ -1,6 +1,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { chromium } from 'playwright-core';
+
+// playwright-core is loaded on demand, not at module level. The packaged Android
+// build deliberately ships without it (there is no Chrome inside the sandbox, so
+// the desktop Pixiv login can never work there). A top-level import would make
+// the whole server fail to start on the phone, taking the gallery down with it.
+let chromium = null;
+let playwrightError = '';
+try {
+  ({ chromium } = await import('playwright-core'));
+} catch (error) {
+  playwrightError = error.message || String(error);
+}
+
+export function loginBrowserAvailable() {
+  return Boolean(chromium);
+}
 
 export function findLoginBrowser() {
   const candidates = [process.env.DFLOW_LOGIN_BROWSER,
@@ -32,6 +47,7 @@ export class PixivBrowserLogin {
   }
   async open() {
     const generation = ++this.generation;
+    if(!chromium) throw Error('当前环境未包含浏览器组件（手机版不提供 Pixiv 官方登录），请使用手动 Cookie 登录。' + (playwrightError ? `（${playwrightError}）` : ''));
     if(!this.browserPath) throw Error('找不到 Chrome/Edge。请安装浏览器，或设置 DFLOW_LOGIN_BROWSER；也可使用手动 Cookie 登录。');
     this.state = {status:'starting',message:'正在打开 Pixiv 官方登录窗口…'};
     try {

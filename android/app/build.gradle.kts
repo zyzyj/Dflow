@@ -11,8 +11,8 @@ android {
         applicationId = "com.zyzyj.dflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.3.8"
+        versionCode = 2
+        versionName = "0.3.8-test1"
 
         // The APK ships a self-contained Linux userland (proot + Alpine rootfs +
         // node_modules), so it only makes sense on 64-bit ARM. Shipping other
@@ -23,6 +23,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Test builds install alongside a real one and never touch its data.
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = false
         }
