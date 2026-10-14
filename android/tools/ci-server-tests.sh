@@ -49,4 +49,7 @@ DFLOW_E2E_PORT=4199 DFLOW_DATA_DIR="$DATA" python3 android/tools/e2e-reverse-ima
 echo "--- 版本比较（纯函数）---"
 node android/tools/test-version.mjs
 
+echo "--- AI 地址规则与网络诊断（纯函数）---"
+node android/tools/test-ai-url.mjs
+
 echo "===== CI 服务端验证全部通过 ====="

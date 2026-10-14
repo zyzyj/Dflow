@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
@@ -40,6 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -90,11 +92,28 @@ fun AiScreen(
             value = state.baseUrl,
             onValueChange = { onFieldChange(it, null, null, null, null, null) },
             label = { Text("API 地址") },
-            placeholder = { Text("api.openai.com 或 192.168.1.5:11434") },
+            placeholder = { Text("https://api.openai.com/v1") },
+            // Spell out the rule instead of silently rewriting the value: an
+            // earlier build appended /v1 whenever the path lacked a version
+            // segment, which broke relays mounted at /openai/v1 or /api and made
+            // the failure look like a bad key.
             supportingText = {
-                Text("可省略 http(s):// 与 /v1；本机与内网地址会自动用 http")
+                val hint = androidx.compose.runtime.remember(state.baseUrl) { baseUrlWarning(state.baseUrl) }
+                Text(
+                    text = hint.ifBlank {
+                        "按服务商的完整路径填写，原样使用，不会自动补 /v1。" +
+                            "可省略 http(s)://（本机与内网自动用 http）。"
+                    },
+                    color = if (hint.isBlank()) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.tertiary,
+                )
             },
             singleLine = true,
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Uri,
+                autoCorrectEnabled = false,
+                imeAction = ImeAction.Next,
+            ),
             modifier = Modifier.fillMaxWidth(),
         )
 
@@ -104,8 +123,16 @@ fun AiScreen(
             label = { Text("API Key") },
             supportingText = { Text("本机服务若不校验密钥，可留空") },
             singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            // No PasswordVisualTransformation and no KeyboardType.Password on
+            // purpose. A masked field plus the system's secure keyboard makes it
+            // impossible to verify an API key you are pasting or typing by hand,
+            // and secure input methods frequently refuse to offer clipboard
+            // suggestions — which is how keys are normally entered.
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Text,
+                autoCorrectEnabled = false,
+                imeAction = ImeAction.Next,
+            ),
             modifier = Modifier.fillMaxWidth(),
         )
 
@@ -129,8 +156,27 @@ fun AiScreen(
         }
 
         state.modelsError?.let { error ->
-            ResultRow(ok = false, text = error)
+            // Multi-line: the server includes the resolved URL and a path hint,
+            // which is what makes a 404 explainable instead of mysterious.
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                SelectionContainer {
+                    Text(
+                        text = error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.padding(12.dp),
+                    )
+                }
+            }
         }
+
+        // Show exactly what will be requested, so a mismatch with the provider's
+        // documentation is visible before pressing the button.
+        RequestPreview(baseUrl = state.baseUrl, model = state.model)
 
         // Model picker. A dropdown when the list was fetched, a plain field
         // otherwise, so an endpoint that does not implement /models is still usable.
@@ -316,6 +362,89 @@ fun AiScreen(
 @Composable
 private fun SectionTitle(text: String) {
     Text(text, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 4.dp))
+}
+
+/**
+ * Client-side mirror of the server's URL rule.
+ *
+ * The server is authoritative (it is the one making the request), but showing the
+ * consequence while typing avoids a round trip just to find out that the path was
+ * wrong. Kept deliberately narrow: it only *warns*, never rewrites.
+ */
+private fun baseUrlWarning(input: String): String {
+    val value = input.trim()
+    if (value.isEmpty()) return ""
+    // Drop scheme for the path check; a malformed URL is not worth guessing at.
+    val withoutScheme = value.replace(Regex("^https?://", RegexOption.IGNORE_CASE), "")
+    val slash = withoutScheme.indexOf('/')
+    val path = if (slash >= 0) withoutScheme.substring(slash) else ""
+    val host = if (slash >= 0) withoutScheme.substring(0, slash) else withoutScheme
+    if (host.isBlank() || !host.contains('.')) {
+        // Hostnames without a dot are legal on a LAN but usually a typo.
+        if (!host.contains(":") && !host.contains(".")) {
+            return "地址看起来不完整：缺少主机名或端口。"
+        }
+    }
+    if (path.isEmpty() || path == "/") {
+        return "没填路径。多数 OpenAI 兼容服务需要 /v1，请按服务商文档补全（本应用不会自动添加）。"
+    }
+    if (!Regex("/v\\d+$").containsMatchIn(path)) {
+        return "路径为 $path。确认服务端确实在这里监听；若需要 /v1，请自行补全。"
+    }
+    return ""
+}
+
+/**
+ * Shows the exact URL that will be requested.
+ *
+ * The single most useful thing when a fetch fails, because "I typed it exactly
+ * like the docs" and the actual request can differ in ways the field does not
+ * reveal — a dropped /v1, an added scheme, a missing path.
+ */
+@Composable
+private fun RequestPreview(baseUrl: String, model: String) {
+    val resolved = remember(baseUrl) { resolvePreview(baseUrl) }
+    if (resolved.isBlank()) return
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                "实际请求地址",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "$resolved/models",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+            )
+            Text(
+                text = "$resolved/chat/completions" + if (model.isNotBlank()) "   （模型 $model）" else "",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+            )
+        }
+    }
+}
+
+/** Mirrors the server's normalisation closely enough to preview the URL. */
+private fun resolvePreview(input: String): String {
+    val value = input.trim()
+    if (value.isEmpty()) return ""
+    var url = value
+    if (!Regex("^https?://", RegexOption.IGNORE_CASE).containsMatchIn(url)) {
+        val host = url.split('/')[0].split(':')[0]
+        val local = host == "localhost" || host == "127.0.0.1" || host == "::1" ||
+            host.startsWith("10.") || host.startsWith("192.168.") ||
+            Regex("^172\\.(1[6-9]|2\\d|3[01])\\.").containsMatchIn(host)
+        url = (if (local) "http://" else "https://") + url
+    }
+    url = url.trimEnd('/')
+    url = url.replace(Regex("/chat/completions$", RegexOption.IGNORE_CASE), "")
+    return url
 }
 
 @Composable

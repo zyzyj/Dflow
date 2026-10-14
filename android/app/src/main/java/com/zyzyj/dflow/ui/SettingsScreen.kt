@@ -13,11 +13,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -356,6 +359,17 @@ private fun Field(
     secret: Boolean = false,
     singleLine: Boolean = true,
 ) {
+    // Secrets start visible and can be masked with the eye button.
+    //
+    // The previous behaviour (always masked, platform secure keyboard) made it
+    // impossible to verify a pasted key, and secure input methods routinely
+    // suppress clipboard suggestions — so the normal way of entering a key was
+    // fought by the UI. Showing it by default is the right trade-off for a
+    // settings screen the user opens deliberately; the toggle covers shoulder
+    // surfing.
+    // Keyed only on `secret` so typing does not reset the toggle on every
+    // keystroke, which would make the eye button appear to flicker.
+    var masked by remember(secret) { mutableStateOf(false) }
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
@@ -363,11 +377,26 @@ private fun Field(
         supportingText = if (hint.isNotBlank()) ({ Text(hint) }) else null,
         singleLine = singleLine,
         minLines = if (singleLine) 1 else 3,
-        visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
+        visualTransformation = if (secret && masked) PasswordVisualTransformation()
+        else VisualTransformation.None,
         keyboardOptions = KeyboardOptions(
-            keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text,
+            // Never Password: that selects the secure IME, which is what blocked
+            // pasting. No autocorrect either, so keys are not mangled.
+            keyboardType = KeyboardType.Text,
+            autoCorrectEnabled = false,
             imeAction = ImeAction.Next,
         ),
+        trailingIcon = if (secret && value.isNotEmpty()) {
+            {
+                IconButton(onClick = { masked = !masked }) {
+                    Icon(
+                        imageVector = if (masked) Icons.Filled.VisibilityOff
+                        else Icons.Filled.Visibility,
+                        contentDescription = if (masked) "显示" else "隐藏",
+                    )
+                }
+            }
+        } else null,
         modifier = Modifier.fillMaxWidth(),
     )
 }

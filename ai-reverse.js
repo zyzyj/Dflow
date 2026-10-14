@@ -24,10 +24,18 @@ const MIME_BY_EXT = {
 /**
  * Normalises a user-supplied base URL.
  *
- * People paste any of: `api.example.com`, `https://api.example.com`,
- * `https://api.example.com/v1`, or the full `/v1/chat/completions`. Accepting
- * all of them avoids a class of "I typed it exactly like the docs but it 404s"
- * failures.
+ * The rule is simple on purpose: **what the user typed is what gets used.**
+ * An earlier version appended `/v1` whenever the path did not already end in a
+ * version segment, which silently rewrote perfectly valid input — relays are
+ * commonly mounted at `/openai/v1`, `/api`, or something else entirely, and a
+ * base URL without any path is legitimate for a reverse proxy that maps it
+ * itself. The appended segment turned those into 404s that looked like a bad key.
+ *
+ * Two normalisations are still applied, because neither can change which
+ * endpoint is addressed:
+ *   - a missing scheme defaults to https (http for loopback/private addresses,
+ *     which is what local model servers speak)
+ *   - a trailing slash is dropped, and a pasted `/chat/completions` is stripped
  */
 export function normalizeBaseUrl(input) {
   let value = String(input || '').trim();
@@ -43,12 +51,111 @@ export function normalizeBaseUrl(input) {
     value = `${isLocal ? 'http' : 'https'}://${value}`;
   }
   value = value.replace(/\/+$/, '');
-  // Strip a trailing endpoint path if the user pasted the whole thing.
+  // The user may paste the full endpoint instead of the base; dropping the known
+  // suffix is unambiguous because the client appends it again.
   value = value.replace(/\/chat\/completions$/i, '');
-  if (!/\/v\d+$/i.test(value)) value = `${value}/v1`;
   return value;
 }
 
+/**
+ * Whether a base URL looks like it is missing its API prefix.
+ *
+ * Reported to the user as a hint rather than applied silently. Guessing wrong
+ * here is worse than asking: a wrong guess costs a confusing 404, while the hint
+ * costs one glance.
+ */
+export function baseUrlHint(input) {
+  const value = normalizeBaseUrl(input);
+  if (!value) return '';
+  let path = '';
+  try {
+    path = new URL(value).pathname.replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+  if (!path || path === '/') {
+    return '地址没有路径。若服务端需要 /v1（多数 OpenAI 兼容服务需要），请一并填写，例如 ' +
+      `${value}/v1。本应用不会替你补。`;
+  }
+  if (!/\/v\d+$/.test(path)) {
+    // Something like /openai or /api — plausible, but worth confirming.
+    return `当前路径为 ${path}。确认服务端确实在这个路径下监听；若需要 /v1，请自行补全。`;
+  }
+  return '';
+}
+
+/**
+ * Builds the endpoint for one API call.
+ *
+ * Joins rather than appends so a base URL that already ends in `/v1` is not
+ * turned into `/v1/v1`.
+ */
+export function endpointFor(baseUrl, suffix) {
+  const base = normalizeBaseUrl(baseUrl);
+  if (!base) return '';
+  const clean = suffix.startsWith('/') ? suffix : `/${suffix}`;
+  return base + clean;
+}
+
+/**
+ * Turns a transport-level failure into something actionable.
+ *
+ * These errors carry no status code, and the raw text is "fetch failed" — which
+ * says nothing about whether the host is wrong, the network is blocked, or a
+ * proxy is in the way. The three causes have different fixes, so they are named
+ * separately.
+ */
+function describeNetworkFailure(error, url, proxy, timeoutMs) {
+  const codes = [error?.code, error?.cause?.code, error?.name, error?.cause?.name,
+                 ...(Array.isArray(error?.cause?.errors) ? error.cause.errors.map(e => e?.code) : [])]
+                .filter(Boolean).map(String);
+  const has = (...want) => want.some(w => codes.includes(w));
+  const via = proxy ? `\n当前代理：${proxy}（模型请求也走这个代理）` : '';
+  const hint = baseUrlHint(url.replace(/\/models$/, ''));
+
+  if (has('ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'TimeoutError', 'AbortError')) {
+    return `连接超时（${timeoutMs / 1000} 秒）\n请求地址：${url}${via}\n`
+      + (proxy
+        ? '模型服务可能无法经当前代理访问。可在设置里清空代理后重试，或换一个能直达该服务的代理。'
+        : '服务端可能无法直连该地址。若该服务需要代理，请在设置里配置。');
+  }
+  if (has('ENOTFOUND', 'EAI_AGAIN')) {
+    return `无法解析域名\n请求地址：${url}${via}\n请确认地址拼写正确。`;
+  }
+  if (has('ECONNREFUSED')) {
+    return `连接被拒绝\n请求地址：${url}${via}\n`
+      + (proxy ? '这通常是代理未在监听，或代理不允许该目标。' : '该地址没有服务在监听，请确认端口。');
+  }
+  if (has('CERT', 'UNABLE_TO_VERIFY', 'ERR_TLS', 'SSL')) {
+    return `TLS 证书校验失败\n请求地址：${url}${via}\n`
+      + '若是自建服务使用了自签名证书，请改用 http 地址（仅限内网）。';
+  }
+  return `无法连接\n请求地址：${url}${via}\n`
+    + `错误：${error?.message || error}${codes.length ? `（${codes.join('/')}）` : ''}`
+    + (hint ? `\n${hint}` : '');
+}
+
+/**
+ * fetch wrapper that converts transport failures into actionable messages.
+ *
+ * Used by both the model-list and the reverse call so a connection problem is
+ * explained the same way in both places, instead of surfacing as "fetch failed".
+ */
+async function fetchWithDiagnosis(url, options, { proxy = '', timeoutMs = 20000 } = {}) {
+  try {
+    return await fetch(url, options);
+  } catch (error) {
+    // An aborted request (user pressed cancel) is not a network fault.
+    if (error?.name === 'AbortError' && !options?.signal?.aborted) {
+      throw error;
+    }
+    throw new Error(describeNetworkFailure(error, url, proxy, timeoutMs));
+  }
+}
+
+export { describeNetworkFailure };
+
+/** Whether a base URL and model are both set, i.e. the built-in reverse can run. */
 export function isConfigured(account) {
   return Boolean(account?.aiBaseUrl && account?.aiModel);
 }
@@ -59,23 +166,37 @@ export function isConfigured(account) {
  * The reply shape varies (OpenAI, vLLM, Jan, assorted relays), so the id is
  * picked out defensively rather than assuming `data[].id`.
  */
-export async function listModels({ baseUrl, apiKey, timeoutMs = 20000 }) {
+export async function listModels({ baseUrl, apiKey, timeoutMs = 20000, proxy = '' }) {
   const base = normalizeBaseUrl(baseUrl);
   if (!base) throw new Error('请先填写 API 地址');
 
-  const response = await fetch(`${base}/models`, {
-    headers: {
-      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-      Accept: 'application/json',
-    },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  const url = `${base}/models`;
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: {
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    // A connection-level failure has no HTTP status, so it must be explained
+    // here. The proxy is called out explicitly because it is applied globally to
+    // every outbound request: a proxy configured for an image board will also
+    // carry (or block) model traffic, and nothing else in the UI says so.
+    throw new Error(describeNetworkFailure(error, url, proxy, timeoutMs));
+  }
 
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`拉取模型列表失败（HTTP ${response.status}）：${describeHttpError(response.status, text)}`);
+    const hint = baseUrlHint(baseUrl);
+    throw new Error(
+      `拉取模型列表失败（HTTP ${response.status}）：${describeHttpError(response.status, text)}`
+      + `\n请求地址：${url}`
+      + (hint ? `\n${hint}` : ''),
+    );
   }
-
   let payload;
   try {
     payload = JSON.parse(text);
@@ -165,6 +286,7 @@ export async function reverseImage({
   maxTokens = 2048,
   temperature = 0.7,
   timeoutMs = 180000,
+  proxy = '',
   onDelta,
   signal,
 }) {
@@ -191,7 +313,7 @@ export async function reverseImage({
     dataUrl = readImageAsDataUrl(imagePath);
   }
 
-  const response = await fetch(`${base}/chat/completions`, {
+  const response = await fetchWithDiagnosis(`${base}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -213,11 +335,15 @@ export async function reverseImage({
       ],
     }),
     signal: signal || AbortSignal.timeout(timeoutMs),
-  });
+  }, { proxy, timeoutMs });
 
   if (!response.ok) {
     const text = await response.text().catch(() => '');
-    throw new Error(`模型调用失败（HTTP ${response.status}）：${describeHttpError(response.status, text)}`);
+    throw new Error(
+      `模型调用失败（HTTP ${response.status}）：${describeHttpError(response.status, text)}`
+      + `\n请求地址：${base}/chat/completions`
+      + (proxy ? `\n当前代理：${proxy}` : ''),
+    );
   }
 
   // Some relays ignore `stream: true` and answer with a single JSON body, so the

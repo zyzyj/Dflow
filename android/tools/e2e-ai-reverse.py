@@ -197,7 +197,8 @@ def main():
     check('POST /api/ai/models', code == 200, f'HTTP {code}')
     models = body.get('models', [])
     check('返回 3 个模型', len(models) == 3, str(models))
-    check('归一化后的地址带 /v1', str(body.get('baseUrl', '')).endswith('/v1'), body.get('baseUrl'))
+    check('地址原样使用（不再自动补 /v1）', str(body.get('baseUrl', '')).endswith(str(MOCK_PORT)) and not str(body.get('baseUrl','')).endswith('/v1'), body.get('baseUrl'))
+    check('返回实际请求地址', str(body.get('requestedUrl','')).endswith('/models'), body.get('requestedUrl'))
 
     print("=== 3. 密钥错误时的提示 ===")
     MockHandler.mode = 'bad_key'

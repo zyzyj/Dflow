@@ -6,6 +6,7 @@ import {
   buildInstruction as buildAiInstruction,
   cleanPrompt as cleanAiPrompt,
   normalizeBaseUrl as normalizeAiBaseUrl,
+  baseUrlHint,
   isConfigured as isAiConfigured,
 } from './ai-reverse.js';
 import { danbooruCredentials, normalizePixivCookie, authFailure } from './auth.js';
@@ -315,6 +316,7 @@ async function builtinReverseForMcp({ bytes, mimeType, reversePreset, expansionP
     imageBytes: bytes,
     imageMimeType: mimeType,
     instruction: buildAiInstruction({ reversePreset, expansionPreset, customInstruction }),
+    proxy: activeProxy,
   });
   return { prompt: cleanAiPrompt(raw) };
 }
@@ -2299,11 +2301,30 @@ app.post('/api/ai/models', async (req, res) => {
   // does not re-send the key it never received.
   const baseUrl = String(body.aiBaseUrl ?? sharedState.account.aiBaseUrl ?? '').trim();
   const apiKey = body.aiApiKey ? String(body.aiApiKey).trim() : (sharedState.account.aiApiKey || '');
+  const resolvedBase = normalizeAiBaseUrl(baseUrl);
+  // Log the attempt and its outcome. Previously a failed model fetch left no
+  // trace anywhere, so an exported log could not show what was even tried —
+  // the only clue was the message on screen.
+  console.log(`[ai] 拉取模型列表：${resolvedBase || '(地址为空)'}`);
   try {
     const models = await listAiModels({ baseUrl, apiKey });
-    res.json({ ok: true, models, baseUrl: normalizeAiBaseUrl(baseUrl) });
+    console.log(`[ai] 模型列表成功：${models.length} 个`);
+    res.json({
+      ok: true,
+      models,
+      baseUrl: resolvedBase,
+      requestedUrl: resolvedBase ? `${resolvedBase}/models` : '',
+      hint: baseUrlHint(baseUrl),
+    });
   } catch (error) {
-    res.status(502).json({ ok: false, error: error.message });
+    console.error(`[ai] 拉取模型列表失败：${error.message}`);
+    res.status(502).json({
+      ok: false,
+      error: error.message,
+      requestedUrl: resolvedBase ? `${resolvedBase}/models` : '',
+      proxy: activeProxy,
+      hint: baseUrlHint(baseUrl),
+    });
   }
 });
 
