@@ -170,6 +170,16 @@ jobs:
           set -eux
           python3 android/tools/verify-tar.py app-assets/rootfs.tar.gz app-assets/app.tar.gz
 
+      # verify-tar only walks the tar headers. This goes further and performs the
+      # real extraction on the real archives, checking that the resulting tree is
+      # usable: symlinks preserved, /bin/sh and /usr/bin/node present, no link
+      # loop. A staging-then-copy implementation (which follows symlinks) fails
+      # here instead of on the user's phone.
+      - name: Simulate the on-device bootstrap
+        run: |
+          set -eux
+          python3 android/tools/simulate-bootstrap.py app-assets/rootfs.tar.gz app-assets/app.tar.gz
+
       - name: Attach assets to the Android project
         run: |
           set -eux

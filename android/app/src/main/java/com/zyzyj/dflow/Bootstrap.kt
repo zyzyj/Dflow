@@ -50,20 +50,19 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         paths.rootfsDir.deleteRecursively()
         paths.rootfsDir.mkdirs()
 
-        val staged = File(paths.filesDir, "rootfs.staging")
-        staged.deleteRecursively()
-        staged.mkdirs()
-
+        // Extract straight into the destination. An earlier version unpacked to
+        // a staging directory and then copied it across, which destroyed the
+        // rootfs: copying follows symlinks, so links to directories were walked
+        // into (var/run -> ../run and var/spool/mail -> ../mail form a loop, and
+        // the OS reports "Too many symbolic links") and dangling links like
+        // etc/mtab -> ../proc/mounts failed outright. The tar itself is the
+        // atomic unit here, not the directory copy.
         TarExtractor.extractArchive(
             archive = materialiseAsset(ASSET_ROOTFS),
-            destination = staged,
+            destination = paths.rootfsDir,
             onProgress = { bytes -> onProgress(Progress("正在解压运行环境", bytes)) },
         )
 
-        val from = File(staged, "rootfs")
-        val source = if (from.isDirectory) from else staged
-        source.copyRecursivelyInto(paths.rootfsDir)
-        staged.deleteRecursively()
         marker.writeText("ok")
         ensureGuestRuntimeFiles()
     }
@@ -71,6 +70,9 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
     private fun installAppTree(onProgress: (Progress) -> Unit) {
         onProgress(Progress("正在安装应用文件", 0))
 
+        // The archive is rooted at app/, so it lands in its own directory; the
+        // app tree is then assembled by moving children into place rather than
+        // copying them, for the same symlink reason as the rootfs.
         val staged = File(paths.filesDir, "app.staging")
         staged.deleteRecursively()
         staged.mkdirs()
@@ -88,10 +90,16 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         // Replace app code but never touch the user's data directory.
         paths.appDir.mkdirs()
         source.listFiles()?.forEach { file ->
-            val target = File(paths.appDir, file.name)
             if (file.name == "data") return@forEach
+            val target = File(paths.appDir, file.name)
             if (target.exists()) target.deleteRecursively()
-            file.copyRecursivelyInto(target)
+            // rename() moves the directory entry itself, so symlinks and their
+            // targets inside node_modules survive intact. A recursive copy would
+            // dereference them.
+            if (!file.renameTo(target)) {
+                file.copyRecursively(target, overwrite = true)
+                file.deleteRecursively()
+            }
         }
         staged.deleteRecursively()
         paths.dataDir.mkdirs()
@@ -169,19 +177,6 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
             if (temp.length() > 0) return temp
         }
         throw IOException("缺少资源文件：${candidates.joinToString(" 或 ")}")
-    }
-
-    private fun File.copyRecursivelyInto(target: File) {
-        if (isDirectory) {
-            target.mkdirs()
-            listFiles()?.forEach { it.copyRecursivelyInto(File(target, it.name)) }
-        } else {
-            parentFile?.mkdirs()
-            target.parentFile?.mkdirs()
-            copyTo(target, overwrite = true)
-            // Preserve executability: the rootfs relies on it for /bin/sh etc.
-            if (canExecute()) target.setExecutable(true, false)
-        }
     }
 
     companion object {
