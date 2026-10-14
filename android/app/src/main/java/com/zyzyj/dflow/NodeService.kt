@@ -17,6 +17,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import java.io.File
 
 /**
  * Hosts the embedded Node server as a foreground service.
@@ -39,6 +40,9 @@ class NodeService : Service() {
     override fun onCreate() {
         super.onCreate()
         paths = RuntimePaths(this)
+        // Start persisting before the bootstrap, so a first-launch failure is
+        // recoverable from the log instead of only visible on screen.
+        LogStore.init(this)
         createNotificationChannel()
     }
 
@@ -74,10 +78,15 @@ class NodeService : Service() {
             _state.value = State.Bootstrapping
 
             paths.dataDir.mkdirs()
-            val server = ProotLauncher(paths, PORT, onLog = ::appendLog)
+            // Bind address is read from a plain file rather than from server state:
+            // it has to be known *before* the guest starts, and the guest is what
+            // owns that state. Changing it therefore requires a restart, which the
+            // settings screen says explicitly.
+            val bindHost = readBindHost()
+            val server = ProotLauncher(paths, PORT, bindHost, onLog = ::appendLog)
             launcher = server
             notify("正在启动 Node 服务…")
-            appendLog("[host] launching PRoot on port $PORT")
+            appendLog("[host] launching PRoot on $bindHost:$PORT")
             val ready = server.startAndAwait()
             if (ready) {
                 appendLog("[host] server is listening on 127.0.0.1:$PORT")
@@ -93,6 +102,13 @@ class NodeService : Service() {
             _state.value = State.Failed(error.message ?: "启动失败")
             notify("启动失败：${error.message}")
         }
+    }
+
+    /** Reads the requested bind scope; defaults to loopback-only. */
+    private fun readBindHost(): String {
+        val file = File(paths.filesDir, BIND_FILE)
+        val value = runCatching { file.takeIf { it.isFile }?.readText()?.trim() }.getOrNull()
+        return if (value == "lan") "0.0.0.0" else "127.0.0.1"
     }
 
     private fun stopServer() {
@@ -120,6 +136,8 @@ class NodeService : Service() {
         logs.addLast(line)
         while (logs.size > MAX_LOG_LINES) logs.removeFirst()
         _log.value = logs.joinToString("\n")
+        // Also persist it: the ring buffer above only survives this process.
+        LogStore.append("node", line)
     }
 
     // ---- notification ------------------------------------------------------
@@ -174,6 +192,9 @@ class NodeService : Service() {
         private const val NOTIFICATION_ID = 4173
         private const val MAX_LOG_LINES = 400
         const val ACTION_STOP = "com.zyzyj.dflow.STOP"
+
+        /** Holds "local" or "lan"; read at startup by [readBindHost]. */
+        const val BIND_FILE = "bind-scope.txt"
 
         private val _state = MutableStateFlow<State>(State.Stopped)
         val state: StateFlow<State> = _state

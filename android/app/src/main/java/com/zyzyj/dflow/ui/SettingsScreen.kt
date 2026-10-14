@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -51,8 +52,12 @@ import com.zyzyj.dflow.data.Account
 fun SettingsScreen(
     state: SettingsUiState,
     appVersion: String,
+    logExportName: String,
     onSave: (Account) -> Unit,
     onTestNetwork: () -> Unit,
+    onExportLogs: (String) -> Unit,
+    onViewLogs: () -> Unit,
+    onClearLogs: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var account by remember(state.state.account) { mutableStateOf(state.state.account) }
@@ -230,6 +235,72 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.bodyMedium,
                 color = if (state.messageIsError) MaterialTheme.colorScheme.error
                 else MaterialTheme.colorScheme.primary,
+            )
+        }
+
+        HorizontalDivider()
+        SectionTitle("日志")
+
+        InfoCard(
+            "包含 App 运行日志、PRoot 输出、服务端日志，以及版本、设备、目录状态等信息。" +
+                "导出内容不含任何密钥与 Cookie（Danbooru Key、Pixiv Cookie、翻译/AI 密钥都不会写入）。"
+        )
+
+        if (state.logs.loading) {
+            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+        }
+
+        state.logs.server?.let { info ->
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        "服务端 v${info.version}" +
+                            (if (info.commit.isNotBlank()) "  构建 ${info.commit.take(7)}" else "  （无构建信息）"),
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    Text(
+                        "Node ${info.node}  ${info.platform}/${info.arch}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Text(
+                        "已运行 ${info.uptimeSeconds / 60} 分钟  日志 ${info.totalBytes / 1024} KB",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        "Danbooru ${if (info.account.danbooru) "✓" else "✗"}   " +
+                            "Pixiv ${if (info.account.pixiv) "✓" else "✗"}   " +
+                            "AI ${if (info.account.aiConfigured) "✓ " + info.account.aiModel else "✗"}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { onExportLogs(logExportName) },
+                enabled = !state.logs.exporting,
+            ) {
+                if (state.logs.exporting) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                else Text("导出日志到…")
+            }
+            OutlinedButton(onClick = onViewLogs) { Text("查看") }
+            OutlinedButton(onClick = onClearLogs) { Text("清空") }
+        }
+
+        state.logs.exportedTo?.let {
+            Text(
+                "已导出。若你用文件管理器看不到内容，确认选的位置有读写权限。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
             )
         }
 

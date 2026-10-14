@@ -159,6 +159,8 @@ export async function reverseImage({
   apiKey,
   model,
   imagePath,
+  imageBytes,
+  imageMimeType,
   instruction,
   maxTokens = 2048,
   temperature = 0.7,
@@ -167,11 +169,27 @@ export async function reverseImage({
   signal,
 }) {
   if (!model) throw new Error('请先选择模型');
-  if (!imagePath) throw new Error('这张图还没有可用的本地缓存');
   const base = normalizeBaseUrl(baseUrl);
   if (!base) throw new Error('请先填写 API 地址');
 
-  const dataUrl = readImageAsDataUrl(imagePath);
+  // Two input shapes: a cached file on disk (the library flow) or raw bytes
+  // (an image handed over by an MCP caller). Both end up as a data URL.
+  let dataUrl;
+  if (imageBytes) {
+    if (!Buffer.isBuffer(imageBytes) || imageBytes.length < 24) {
+      throw new Error('传入的图片数据无效');
+    }
+    // Guard the request size: base64 inflates by ~33%, and most endpoints cap the
+    // body well below this. Failing with a clear reason beats a truncated upload.
+    const limit = 24 * 1024 * 1024;
+    if (imageBytes.length > limit) {
+      throw new Error(`图片过大（${(imageBytes.length / 1048576).toFixed(1)} MB），请改用较小的图或降低画质`);
+    }
+    dataUrl = `data:${imageMimeType || 'image/png'};base64,${imageBytes.toString('base64')}`;
+  } else {
+    if (!imagePath) throw new Error('这张图还没有可用的本地缓存');
+    dataUrl = readImageAsDataUrl(imagePath);
+  }
 
   const response = await fetch(`${base}/chat/completions`, {
     method: 'POST',

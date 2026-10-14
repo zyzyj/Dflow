@@ -223,6 +223,10 @@ data class Account(
     val aiTemperature: Double = 0.7,
     val aiMaxTokens: Int = 2048,
     val aiCustomInstruction: String = "",
+    // Remote access: off unless the user turns it on from the device itself.
+    val apiEnabled: Boolean = false,
+    val apiToken: String = "",
+    val apiRequireToken: Boolean = true,
 ) {
     val aiConfigured: Boolean get() = aiBaseUrl.isNotBlank() && aiModel.isNotBlank()
 }
@@ -287,6 +291,57 @@ data class AiProgress(val running: Boolean = false, val text: String = "")
 
 @Serializable
 data class AiBatchStart(val ok: Boolean = false, val total: Int = 0, val error: String = "")
+
+// ---- remote access ----------------------------------------------------------
+
+@Serializable
+data class ApiAccess(
+    val ok: Boolean = false,
+    val enabled: Boolean = false,
+    val requireToken: Boolean = true,
+    val token: String = "",
+    val endpoints: List<ApiEndpoint> = emptyList(),
+    val headerName: String = "X-DFlow-Token",
+    val note: String = "",
+)
+
+@Serializable
+data class ApiEndpoint(val host: String = "", val url: String = "", val scope: String = "")
+
+@Serializable
+data class ApiToken(val ok: Boolean = false, val token: String = "")
+
+// ---- diagnostics ------------------------------------------------------------
+
+@Serializable
+data class LogsInfo(
+    val ok: Boolean = false,
+    val directory: String = "",
+    val files: List<LogFile> = emptyList(),
+    val totalBytes: Long = 0,
+    val version: String = "",
+    val commit: String = "",
+    val commitSource: String = "",
+    val node: String = "",
+    val platform: String = "",
+    val arch: String = "",
+    val startedAt: String = "",
+    val uptimeSeconds: Long = 0,
+    val account: LogsAccount = LogsAccount(),
+)
+
+@Serializable
+data class LogFile(val name: String = "", val size: Long = 0, val modifiedAt: String = "")
+
+/** Which optional integrations are configured. Booleans only, never the secrets. */
+@Serializable
+data class LogsAccount(
+    val danbooru: Boolean = false,
+    val pixiv: Boolean = false,
+    val proxy: String = "",
+    val aiConfigured: Boolean = false,
+    val aiModel: String = "",
+)
 
 /** Live counters for a running batch reverse. */
 @Serializable

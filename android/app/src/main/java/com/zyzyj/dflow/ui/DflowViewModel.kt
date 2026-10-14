@@ -2,16 +2,20 @@ package com.zyzyj.dflow.ui
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.zyzyj.dflow.LogStore
 import com.zyzyj.dflow.data.Account
 import com.zyzyj.dflow.data.AiBatch
+import com.zyzyj.dflow.data.ApiEndpoint
 import com.zyzyj.dflow.data.AppState
 import com.zyzyj.dflow.data.DflowApi
 import com.zyzyj.dflow.data.Favorite
+import com.zyzyj.dflow.data.LogsInfo
 import com.zyzyj.dflow.data.McpSession
 import com.zyzyj.dflow.data.NetworkTest
 import com.zyzyj.dflow.data.Post
 import com.zyzyj.dflow.data.PresetLibrary
 import com.zyzyj.dflow.data.Tag
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -20,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Gallery sources the user can switch between. */
 enum class BrowseMode(val label: String, val station: Station) {
@@ -66,6 +71,8 @@ data class LibraryUiState(
     /** Connected agents. Reverse-prompting needs one; empty means the handoff
      *  button cannot succeed, and the UI says so instead of failing on tap. */
     val agents: List<McpSession> = emptyList(),
+    /** Whether cards show selection circles instead of opening on tap. */
+    val selectionMode: Boolean = false,
 )
 
 data class SettingsUiState(
@@ -77,6 +84,8 @@ data class SettingsUiState(
     val networkTest: NetworkTest? = null,
     val testing: Boolean = false,
     val presets: PresetLibrary = PresetLibrary(),
+    /** Diagnostics shown in the settings screen's log section. */
+    val logs: LogsUiState = LogsUiState(),
 )
 
 /**
@@ -105,6 +114,38 @@ data class AiUiState(
 }
 
 /**
+ * State of the retry/export screen for diagnostics.
+ *
+ * The header is built on the device rather than on the server because it has to
+ * describe the host too: app version, Android release, ABI, where the guest tree
+ * lives. None of that is visible from inside the sandbox.
+ */
+data class LogsUiState(
+    val loading: Boolean = false,
+    val server: LogsInfo? = null,
+    val preview: String = "",
+    val error: String? = null,
+    val exporting: Boolean = false,
+    val exportedTo: String = "",
+)
+
+/** State of the remote-access screen. */
+data class ApiUiState(
+    val loading: Boolean = false,
+    val enabled: Boolean = false,
+    val requireToken: Boolean = true,
+    val token: String = "",
+    val endpoints: List<ApiEndpoint> = emptyList(),
+    val headerName: String = "X-DFlow-Token",
+    val note: String = "",
+    val bindScope: String = "local",
+    val error: String? = null,
+    val savedAt: Long = 0,
+) {
+    val lanUrl: String? get() = endpoints.firstOrNull { it.scope == "lan" }?.url
+}
+
+/**
  * Holds screen state and talks to the embedded server.
  *
  * One view model for the whole app because every screen reads from the same
@@ -124,6 +165,16 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
 
     private val _ai = MutableStateFlow(AiUiState())
     val ai: StateFlow<AiUiState> = _ai.asStateFlow()
+
+    private val _logs = MutableStateFlow(LogsUiState())
+    val logs: StateFlow<LogsUiState> = _logs.asStateFlow()
+
+    /** Selected card ids, shared with the UI so bulk actions can act on them. */
+    private val _selection = MutableStateFlow<Set<String>>(emptySet())
+    val selection: StateFlow<Set<String>> = _selection.asStateFlow()
+
+    private val _apiAccess = MutableStateFlow(ApiUiState())
+    val apiAccess: StateFlow<ApiUiState> = _apiAccess.asStateFlow()
 
     private var browseJob: Job? = null
     private var batchPollJob: Job? = null
@@ -385,6 +436,279 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
             } catch (e: DflowApi.ApiException) {
                 // The server's refusals are specific and worth showing as-is
                 // ("prompt and cached image required", "image not cached yet").
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
+
+    // ---- bulk selection -----------------------------------------------------
+
+    fun toggleSelection(id: String) {
+        _selection.update { current ->
+            if (id in current) current - id else current + id
+        }
+    }
+
+    fun clearSelection() {
+        _selection.value = emptySet()
+    }
+
+    fun setSelectionMode(active: Boolean) {
+        _library.update { it.copy(selectionMode = active) }
+        if (!active) _selection.value = emptySet()
+    }
+
+    /** Selects every visible card in the current folder, or clears if all are on. */
+    fun toggleSelectAllInFolder() {
+        val folder = _library.value.folder.key
+        val visible = _library.value.favorites.filter { it.folder == folder }.map { it.id }.toSet()
+        _selection.update { current ->
+            if (visible.isNotEmpty() && current.containsAll(visible)) current - visible else current + visible
+        }
+    }
+
+    fun invertSelectionInFolder() {
+        val folder = _library.value.folder.key
+        val visible = _library.value.favorites.filter { it.folder == folder }.map { it.id }.toSet()
+        _selection.update { current -> visible - current }
+    }
+
+    /**
+     * Removes the selected cards.
+     *
+     * This also deletes their cached image files, because the server treats the
+     * submitted list as authoritative and drops the caches of whatever is
+     * missing. The UI states this plainly — offering a "keep the files" variant
+     * would be a lie unless the server kept orphans on purpose.
+     */
+    fun removeSelected() {
+        val ids = _selection.value
+        if (ids.isEmpty()) return
+        viewModelScope.launch {
+            try {
+                val remaining = api.removeFavorites(ids)
+                _library.update { it.copy(favorites = remaining) }
+                _selection.value = emptySet()
+                _library.update { it.copy(selectionMode = false) }
+                _settings.update { it.copy(message = "已移除 ${ids.size} 张", messageIsError = false) }
+            } catch (e: DflowApi.ApiException) {
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
+
+    /** Moves the selection into the reverse queue. */
+    fun moveSelectedToPending() {
+        val ids = _selection.value
+        if (ids.isEmpty()) return
+        val targets = _library.value.favorites.filter { it.id in ids && it.folder != "pending" }
+        if (targets.isEmpty()) return
+        viewModelScope.launch {
+            var moved = 0
+            var failure: String? = null
+            for (card in targets) {
+                try {
+                    api.patchFavorite(id = card.id, folder = "pending", autoEnabled = true)
+                    moved += 1
+                } catch (e: DflowApi.ApiException) {
+                    // Keep going: one card without a usable image must not strand
+                    // the rest of a bulk action.
+                    if (failure == null) failure = e.message
+                }
+            }
+            _settings.update {
+                it.copy(
+                    message = if (failure != null) "已加入 $moved 张，部分失败：$failure" else "已加入待反推 $moved 张",
+                    messageIsError = failure != null,
+                )
+            }
+            _selection.value = emptySet()
+            _library.update { it.copy(selectionMode = false) }
+            refreshLibrary()
+        }
+    }
+
+    // ---- logs ----------------------------------------------------------------
+
+    fun loadLogs() {
+        _logs.update { it.copy(loading = true, error = null) }
+        // Mirrored into settings state because the log section lives on the
+        // settings screen and reads from there.
+        _settings.update { it.copy(logs = _logs.value) }
+        viewModelScope.launch {
+            val info = runCatching { api.logsInfo() }.getOrNull()
+            val text = runCatching { api.logsText() }.getOrNull()
+            _logs.update {
+                it.copy(
+                    loading = false,
+                    server = info ?: it.server,
+                    preview = text?.takeLast(8000) ?: it.preview,
+                    error = if (info == null) "无法读取服务端日志" else null,
+                )
+            }
+            _settings.update { it.copy(logs = _logs.value) }
+        }
+    }
+
+    fun clearLogs() {
+        viewModelScope.launch {
+            try {
+                api.clearServerLogs()
+                _logs.update { it.copy(preview = "") }
+                _settings.update { it.copy(message = "服务端日志已清空", messageIsError = false) }
+            } catch (e: DflowApi.ApiException) {
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
+
+    /**
+     * Assembles the text to export: a device/runtime header, the host-side log
+     * from this app, and the server's own log from inside the sandbox.
+     *
+     * The three are kept in one file because they interleave in time and the
+     * cause is usually a boundary between them (host starts guest, guest fails,
+     * host reports it).
+     */
+    suspend fun buildLogExport(context: android.content.Context): String {
+        val header = LogStore.buildHeader(context)
+        val hostLog = LogStore.readAll()
+        val serverLog = runCatching { api.logsText() }.getOrDefault("(无法读取服务端日志)")
+        val info = runCatching { api.logsInfo() }.getOrNull()
+        return buildString {
+            appendLine(header)
+            appendLine()
+            appendLine("--- 服务端环境 ---")
+            if (info != null) {
+                appendLine("服务端版本: ${info.version}  提交: ${info.commit.ifBlank { "(未知)" }} (${info.commitSource})")
+                appendLine("Node: ${info.node}  ${info.platform}/${info.arch}")
+                appendLine("启动于: ${info.startedAt}  运行 ${info.uptimeSeconds}s")
+                appendLine("日志目录: ${info.directory}  共 ${info.totalBytes} 字节")
+                appendLine("Danbooru 已配置: ${info.account.danbooru}  Pixiv 已配置: ${info.account.pixiv}")
+                appendLine("AI: ${if (info.account.aiConfigured) "已配置 ${info.account.aiModel}" else "未配置"}")
+                appendLine("代理: ${info.account.proxy.ifBlank { "(无)" }}")
+            } else {
+                appendLine("（服务端信息不可用）")
+            }
+            appendLine()
+            appendLine("--- 主机日志（App 捕获，含 PRoot 输出）---")
+            appendLine(hostLog.ifBlank { "(空)" })
+            appendLine()
+            appendLine("--- 服务端日志（沙箱内写入）---")
+            appendLine(serverLog.ifBlank { "(空)" })
+        }
+    }
+
+    /** Writes the export text to the location the user picked. */
+    fun exportLogs(context: android.content.Context, uri: android.net.Uri) {
+        _logs.update { it.copy(exporting = true) }
+        viewModelScope.launch {
+            try {
+                val text = buildLogExport(context)
+                withContext(Dispatchers.IO) {
+                    val stream = context.contentResolver.openOutputStream(uri)
+                        ?: throw IllegalStateException("无法写入所选位置")
+                    stream.use { it.write(text.toByteArray()) }
+                }
+                val bytes = text.toByteArray().size
+                _logs.update { it.copy(exporting = false, exportedTo = uri.toString()) }
+                _settings.update {
+                    it.copy(
+                        message = "日志已导出（${bytes / 1024} KB）",
+                        messageIsError = false,
+                    )
+                }
+            } catch (e: Throwable) {
+                _logs.update { it.copy(exporting = false) }
+                _settings.update {
+                    it.copy(message = "导出失败：${e.message}", messageIsError = true)
+                }
+            }
+        }
+    }
+
+    /** Suggested file name, timestamped so repeated exports do not overwrite. */
+    fun logExportName(): String {
+        val now = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
+        return "dflow-log-$now.txt"
+    }
+
+    // ---- remote access -------------------------------------------------------
+
+    fun loadApiAccess() {
+        _apiAccess.update { it.copy(loading = true, error = null) }
+        viewModelScope.launch {
+            try {
+                val info = api.apiAccess()
+                val account = _settings.value.state.account
+                _apiAccess.update {
+                    it.copy(
+                        loading = false,
+                        enabled = info.enabled,
+                        requireToken = info.requireToken,
+                        token = info.token.ifBlank { account.apiToken },
+                        endpoints = info.endpoints,
+                        headerName = info.headerName,
+                        note = info.note,
+                        bindScope = if (it.bindScope == "local" && info.endpoints.any { e -> e.scope == "lan" }) "lan" else it.bindScope,
+                    )
+                }
+            } catch (e: DflowApi.ApiException) {
+                _apiAccess.update { it.copy(loading = false, error = e.message) }
+            }
+        }
+    }
+
+    fun setApiEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            try {
+                // Enabling without a token would expose the gallery the moment the
+                // service restarts, so generate one on first use.
+                val existing = _settings.value.state.account.apiToken
+                val account = _settings.value.state.account.copy(apiEnabled = enabled)
+                api.updateAccount(account)
+                _settings.update { it.copy(state = it.state.copy(account = account)) }
+                if (enabled && existing.isBlank()) rotateApiToken()
+                loadApiAccess()
+                _settings.update {
+                    it.copy(
+                        message = if (enabled) "对外接口已启用" else "对外接口已关闭",
+                        messageIsError = false,
+                    )
+                }
+            } catch (e: DflowApi.ApiException) {
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
+
+    fun setApiRequireToken(required: Boolean) {
+        viewModelScope.launch {
+            try {
+                val account = _settings.value.state.account.copy(apiRequireToken = required)
+                api.updateAccount(account)
+                _settings.update { it.copy(state = it.state.copy(account = account)) }
+                loadApiAccess()
+                _settings.update {
+                    it.copy(
+                        message = if (required) "已要求令牌" else "已取消令牌要求（同一网络内任何人都可访问）",
+                        messageIsError = !required,
+                    )
+                }
+            } catch (e: DflowApi.ApiException) {
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
+
+    fun rotateApiToken() {
+        viewModelScope.launch {
+            try {
+                val token = api.rotateApiToken()
+                _settings.update { it.copy(state = it.state.copy(account = it.state.account.copy(apiToken = token))) }
+                _apiAccess.update { it.copy(token = token) }
+                _settings.update { it.copy(message = "已生成新令牌，旧令牌立即失效", messageIsError = false) }
+            } catch (e: DflowApi.ApiException) {
                 _settings.update { it.copy(message = e.message, messageIsError = true) }
             }
         }

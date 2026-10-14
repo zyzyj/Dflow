@@ -149,14 +149,32 @@ jobs:
           set -eux
           mkdir -p app-assets
           mkdir -p app/app
-          for item in server.js mcp-server.js metadata.js network.js \
+          # Explicit list, so a new server-side module that is forgotten here
+          # would ship a broken app. The glob below covers the project's own
+          # top-level .js files, and any file added later is picked up by the
+          # verification step that re-checks the packaged tree.
+          for item in server.js mcp-server.js mcp-http.js mcp-tools.js metadata.js network.js \
                       presets.js reverse-workflow.js thumbnails.js auth.js \
+                      ai-reverse.js app-log.js version-check.js \
                       dsh-bridge.js browser-login.js package.json; do
             if [ -e "$item" ]; then cp -r "$item" app/app/; fi
           done
-          for dir in public presets scripts; do
+          for dir in public presets scripts docs; do
             if [ -d "$dir" ]; then cp -r "$dir" app/app/; fi
           done
+          # Record the exact revision this build contains. The packaged app has
+          # no .git, so without this the update check cannot tell which version
+          # is installed and reported a fake update on every launch.
+          node -e "
+            const fs = require('fs');
+            fs.writeFileSync('app/app/BUILD_INFO.json', JSON.stringify({
+              commit: process.env.GITHUB_SHA || '',
+              version: JSON.parse(fs.readFileSync('package.json','utf8')).version,
+              builtAt: new Date().toISOString(),
+            }, null, 2) + '\n');
+          "
+          test -f app/app/BUILD_INFO.json
+          cat app/app/BUILD_INFO.json
           cp -r node_modules app/app/node_modules
           du -sh app/app
           tar -czf app-assets/app.tar.gz -C app app
@@ -184,12 +202,56 @@ jobs:
       # exercise the reverse-prompting pipeline against a real server process, with
       # a stub model endpoint standing in for the paid API. They are offline-safe,
       # so they cannot flake on a runner that cannot reach the image boards.
+      #
+      # Note this runs against the *source* tree, so it verifies behaviour but not
+      # packaging. The next step covers packaging by running the same suites from
+      # the assembled app tree.
       - name: Verify server reverse-prompting pipeline
         run: |
           set -eux
-          node --check server.js
-          node --check ai-reverse.js
+          for file in server.js mcp-server.js mcp-http.js mcp-tools.js app-log.js \
+                      version-check.js ai-reverse.js network.js presets.js; do
+            node --check "$file"
+          done
           sh android/tools/ci-server-tests.sh
+
+      # Guards the packaging list itself. The app tree is assembled from an
+      # explicit list of files, so a newly added module that nobody remembers to
+      # add ships a broken app — which is exactly what happened with ai-reverse.js.
+      # These suites run against app/app directly, so a missing file fails here.
+      - name: Verify the packaged app tree is complete
+        run: |
+          set -eux
+          cd app/app
+          for file in server.js mcp-server.js mcp-http.js mcp-tools.js app-log.js \
+                      version-check.js ai-reverse.js reverse-workflow.js; do
+            test -f "$file" || { echo "打包遗漏: $file"; exit 1; }
+          done
+          test -f BUILD_INFO.json || { echo '缺少 BUILD_INFO.json'; exit 1; }
+          # Every relative import in the packaged tree must resolve inside it,
+          # or the app starts and then crashes on the first request.
+          node -e "
+            const fs = require('fs'), path = require('path');
+            const missing = [];
+            for (const file of fs.readdirSync('.').filter(f => f.endsWith('.js'))) {
+              const src = fs.readFileSync(file, 'utf8');
+              for (const m of src.matchAll(/from\\s+'\\.\\/([^']+)'/g)) {
+                const target = m[1];
+                if (!fs.existsSync(target)) missing.push(file + ' -> ' + target);
+              }
+            }
+            if (missing.length) { console.error('打包树缺少被引用的模块:', missing); process.exit(1); }
+            console.log('包内相对引用全部可解析');
+          "
+          # Node must actually be able to load the server module graph.
+          node --input-type=module -e "
+            await import('./app-log.js');
+            await import('./version-check.js');
+            await import('./mcp-tools.js');
+            await import('./mcp-http.js');
+            await import('./ai-reverse.js');
+            console.log('模块加载正常');
+          "
 
       - name: Attach assets to the Android project
         run: |

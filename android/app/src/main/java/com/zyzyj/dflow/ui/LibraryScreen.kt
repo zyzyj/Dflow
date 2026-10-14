@@ -15,24 +15,28 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid
 import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
 import androidx.compose.foundation.lazy.staggeredgrid.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Circle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,9 +63,16 @@ import com.zyzyj.dflow.data.McpSession
 fun LibraryScreen(
     state: LibraryUiState,
     favoriteIds: Set<String>,
+    selectedIds: Set<String>,
     aiConfigured: Boolean,
     batchRunning: Boolean,
     onFolderChange: (LibraryFolder) -> Unit,
+    onToggleSelectionMode: () -> Unit,
+    onToggleSelected: (Favorite) -> Unit,
+    onSelectAll: () -> Unit,
+    onInvertSelection: () -> Unit,
+    onRemoveSelected: () -> Unit,
+    onMoveSelectedToPending: () -> Unit,
     onOpen: (Favorite, Int) -> Unit,
     onCopyPrompt: (Favorite) -> Unit,
     onEditPrompt: (Favorite) -> Unit,
@@ -169,6 +180,9 @@ fun LibraryScreen(
                             aiConfigured = aiConfigured,
                             batchRunning = batchRunning,
                             agentsAvailable = hasAgents,
+                            selectionMode = state.selectionMode,
+                            selected = favorite.id in selectedIds,
+                            onToggleSelected = { onToggleSelected(favorite) },
                             onOpen = { onOpen(favorite, visible.indexOf(favorite)) },
                             onCopyPrompt = { onCopyPrompt(favorite) },
                             onEditPrompt = { onEditPrompt(favorite) },
@@ -182,6 +196,104 @@ fun LibraryScreen(
                     }
                 }
             }
+        }
+
+        // Bulk actions replace the normal hint bar while selecting, so the
+        // destructive one is never adjacent to an ordinary tap target.
+        if (state.selectionMode) {
+            BulkActionBar(
+                selectedCount = selectedIds.size,
+                canQueue = visible.any { it.id in selectedIds },
+                onRemove = onRemoveSelected,
+                onQueue = onMoveSelectedToPending,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SelectionToolbar(
+    visibleCount: Int,
+    selectedCount: Int,
+    selectionMode: Boolean,
+    onToggleMode: () -> Unit,
+    onSelectAll: () -> Unit,
+    onInvert: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        TextButton(onClick = onToggleMode, enabled = visibleCount > 0) {
+            Text(if (selectionMode) "完成" else "选择")
+        }
+        if (selectionMode) {
+            TextButton(onClick = onSelectAll) { Text("全选") }
+            TextButton(onClick = onInvert) { Text("反选") }
+            Text(
+                "已选 $selectedCount / $visibleCount",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+        } else {
+            Text(
+                "点卡片查看大图；进入选择模式可批量操作",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+/**
+ * Bulk actions.
+ *
+ * Both state their real effect. "移除" also deletes the cached file — the server
+ * drops caches for records that disappear — so offering a variant that claims to
+ * keep them would be dishonest, and keeping orphans would just grow the app's
+ * storage until the user clears data.
+ */
+@Composable
+private fun BulkActionBar(
+    selectedCount: Int,
+    canQueue: Boolean,
+    onRemove: () -> Unit,
+    onQueue: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onQueue, enabled = canQueue && selectedCount > 0) {
+                    Text("加入待反推")
+                }
+                TextButton(
+                    onClick = onRemove,
+                    enabled = selectedCount > 0,
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) {
+                    Text("移除并删除原图")
+                }
+            }
+            Text(
+                "移除会一并删掉本地缓存图，之后需重新下载。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+            )
         }
     }
 }
@@ -210,6 +322,9 @@ private fun FavoriteCard(
     aiConfigured: Boolean,
     batchRunning: Boolean,
     agentsAvailable: Boolean,
+    selectionMode: Boolean,
+    selected: Boolean,
+    onToggleSelected: () -> Unit,
     onOpen: () -> Unit,
     onCopyPrompt: () -> Unit,
     onEditPrompt: () -> Unit,
@@ -226,7 +341,7 @@ private fun FavoriteCard(
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column {
-            Box(Modifier.clickable(onClick = onOpen)) {
+            Box(Modifier.clickable { if (selectionMode) onToggleSelected() else onOpen() }) {
                 if (imageUrl != null) {
                     AsyncImage(
                         model = imageUrl,
@@ -266,14 +381,49 @@ private fun FavoriteCard(
                     favorite = favorite,
                     modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
                 )
+
+                // Selection marker. A ring plus a check reads at a glance on a
+                // busy thumbnail, where a tint alone would not.
+                if (selectionMode) {
+                    Box(
+                        Modifier
+                            .align(Alignment.TopStart)
+                            .padding(6.dp)
+                            .size(24.dp)
+                            .background(
+                                if (selected) MaterialTheme.colorScheme.primary
+                                else Color.Black.copy(alpha = 0.45f),
+                                CircleShape,
+                            ),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = if (selected) Icons.Filled.Check else Icons.Filled.Circle,
+                            contentDescription = if (selected) "已选中" else "未选中",
+                            tint = Color.White,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+
+                // Dim unselected cards so the chosen set stands out in a dense grid.
+                if (selectionMode && !selected) {
+                    Box(
+                        Modifier
+                            .matchParentSize()
+                            .background(Color.Black.copy(alpha = 0.35f)),
+                    )
+                }
             }
 
-            // Actions, chosen per folder: only the moves the server will accept.
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            // Actions are hidden while selecting: the whole card is a toggle then,
+            // and a stray tap must not start an unrelated operation.
+            if (!selectionMode) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                 when (favorite.folder) {
                     "original" -> {
                         CardAction("AI", Icons.Filled.AutoAwesome, "加入待反推", onEnqueue)
@@ -307,6 +457,7 @@ private fun FavoriteCard(
                         CardAction("复制", Icons.Filled.ContentCopy, "复制提示词", onCopyPrompt)
                     }
                 }
+            }
             }
         }
     }

@@ -84,6 +84,16 @@ class DflowApi(private val port: Int) {
         }
     }
 
+    private suspend fun deleteRaw(path: String): String = withContext(Dispatchers.IO) {
+        try {
+            execute(Request.Builder().url(url(path)).delete().build())
+        } catch (e: ApiException) {
+            throw e
+        } catch (e: IOException) {
+            throw ApiException("无法连接本地服务，请确认服务正在运行", e.message.orEmpty())
+        }
+    }
+
     private suspend fun putRaw(path: String, jsonBody: String): String = withContext(Dispatchers.IO) {
         try {
             execute(
@@ -292,8 +302,47 @@ class DflowApi(private val port: Int) {
 
     suspend fun aiStopBatch(): String = postRaw("/api/ai/batch/stop", "{}")
 
+    // ---- diagnostics --------------------------------------------------------
+
+    /** Build facts and log file list for the export screen. Never includes secrets. */
+    suspend fun logsInfo(): LogsInfo = get("/api/logs/info")
+
+    /** Server-side log text, newest last. */
+    suspend fun logsText(): String = getRaw("/api/logs/text")
+
+    suspend fun clearServerLogs(): String = deleteRaw("/api/logs")
+
+    // ---- bulk editing -------------------------------------------------------
+
+    /**
+     * Removes several cards in one request.
+     *
+     * Sending the whole remaining list once is both faster than N calls and
+     * atomic from the server's point of view; the server then deletes the cache
+     * files of whatever disappeared.
+     */
+    suspend fun removeFavorites(ids: Set<String>): List<Favorite> {
+        val remaining = state().favorites.filterNot { it.id in ids }
+        saveFavorites(remaining)
+        return remaining
+    }
+
     suspend fun updateAccount(account: Account): String =
         putRaw("/api/account", json.encodeToString(Account.serializer(), account))
+
+    // ---- remote access ------------------------------------------------------
+
+    /**
+     * Connection details for the remote-access screen.
+     *
+     * Loopback-only on the server: it returns the token, so it must never be
+     * reachable from another device.
+     */
+    suspend fun apiAccess(): ApiAccess = get("/api/api-access")
+
+    /** Rotates the access token, invalidating any client already configured. */
+    suspend fun rotateApiToken(): String =
+        postRaw("/api/api-access/token", "{}").let { json.decodeFromString<ApiToken>(it).token }
 
     // ---- settings / diagnostics -------------------------------------------
 

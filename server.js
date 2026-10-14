@@ -14,12 +14,18 @@ import express from "express";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { inspectPng } from "./metadata.js";
 import { presetDefaults, migratePresetNames, syncPresetLibrary, canonicalExpansionName, PRESET_STORE, readPresetLibrary, savePresetLibrary } from "./presets.js";
 import { DshBridgeClient, DshBridgeError, publicBridgeError } from "./dsh-bridge.js";
 import { fileURLToPath } from "node:url";
+import { installFileLogging, logDirectory } from './app-log.js';
+import { createAuthMiddleware, createMcpHandler, connectionInfo } from './mcp-http.js';
+import { UPSTREAM_REPO, UPSTREAM_BRANCH, localBuildInfo, fetchUpstreamHead, compareBuilds, upgradeGuidance } from './version-check.js';
 configureNetwork();
+// Install before anything else logs, so startup failures are captured too.
+const LOG_DIR = installFileLogging();
 const app = express();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4173);
@@ -29,17 +35,121 @@ app.use(express.json({ limit: "5mb" }));
 // Always revalidate the shell so a restarted local DFlow service cannot leave
 // the browser on an old app.js/style.css version. Hashed query strings still
 // provide normal cacheability for the static assets themselves.
+// ---- remote access control -------------------------------------------------
+//
+// The gallery holds credentials (Danbooru key, Pixiv cookie, translation and AI
+// keys) and private images. Bound to 127.0.0.1 that is fine, but the moment the
+// service listens on a LAN address every one of those becomes reachable by
+// anything on the same network.
+//
+// Two layers, and both are necessary:
+//   1. Requests from a non-loopback address are refused everything unless remote
+//      access is explicitly enabled.
+//   2. Even then, the endpoints that hand out credentials or make the service do
+//      something destructive stay loopback-only, and /api/state has its secrets
+//      stripped rather than being withheld entirely (the UI needs the rest).
+
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+const isLoopback = req => LOOPBACK.has(req.ip || '');
+
+function apiTokenMatches(req) {
+  const expected = String(sharedState.account.apiToken || '');
+  if (!expected) return false;
+  const provided = String(req.get('X-DFlow-Token') || req.get('x-dflow-token') || '').trim()
+    || (/^Bearer\s+(.+)$/i.exec(String(req.get('authorization') || '').trim())?.[1] || '').trim();
+  if (!provided) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function remoteAccessAllowed(req) {
+  if (isLoopback(req)) return true;
+  if (!sharedState.account.apiEnabled) return false;
+  if (sharedState.account.apiRequireToken === false) return true;
+  return apiTokenMatches(req);
+}
+
+// Endpoints that either reveal a secret, change account credentials, log the
+// service into an external account, or behave destructively on local files.
+// These never become reachable from another device.
+const LOOPBACK_ONLY = [
+  /^\/api\/account\b/,
+  /^\/api\/auth-test\b/,
+  /^\/api\/pixiv\/login\b/,
+  /^\/api\/mcp\/sessions\b/,
+  /^\/api\/mcp\/setup\b/,
+  /^\/api\/dsh\/target\b/,
+  /^\/api\/version\/update\b/,
+  /^\/api\/logs\b/,
+  /^\/api\/ai\/cancel\b/,
+  /^\/api\/ai\/batch\/stop\b/,
+  /^\/api\/favorites\/retry-cache\b/,
+];
+
+app.use((req, res, next) => {
+  if (isLoopback(req)) return next();
+  if (!sharedState.account.apiEnabled) {
+    return res.status(403).json({
+      error: 'DFlow 的对外访问未启用',
+      detail: '请在手机上打开「对外接口」开关后再从其他设备访问。',
+    });
+  }
+  if (sharedState.account.apiRequireToken !== false && !apiTokenMatches(req)) {
+    res.set('WWW-Authenticate', 'Bearer realm="dflow"');
+    return res.status(401).json({
+      error: '需要访问令牌',
+      detail: '请在请求头带上 X-DFlow-Token，或 Authorization: Bearer <令牌>。',
+    });
+  }
+  for (const pattern of LOOPBACK_ONLY) {
+    if (pattern.test(req.path)) {
+      return res.status(403).json({
+        error: '该操作只能在运行 DFlow 的设备上执行',
+        detail: `涉及本机凭据或本地文件，不对远程设备开放：${req.path}`,
+      });
+    }
+  }
+  return next();
+});
+
+// Strips credentials from a state payload sent to a remote caller.
+//
+// Withholding the whole response is not an option: a remote agent needs folder
+// layout and prompt text. Replacing the secrets with a marker keeps the shape
+// intact while ensuring none of them leave the device.
+const SECRET_ACCOUNT_FIELDS = [
+  'loginKey', 'pixivCookie', 'pixivRefreshToken', 'googleTranslateKey',
+  'deeplKey', 'tencentSecretId', 'tencentSecretKey', 'volcAccessKey',
+  'volcSecretKey', 'aiApiKey', 'apiToken', 'proxyUrl',
+];
+function redactState(state, req) {
+  if (isLoopback(req)) return state;
+  const account = { ...(state.account || {}) };
+  for (const field of SECRET_ACCOUNT_FIELDS) {
+    if (account[field]) account[field] = '__redacted__';
+  }
+  return { ...state, account };
+}
+
 app.get("/", (_req, res) => {
   res.set("Cache-Control", "no-store, max-age=0");
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 app.use(express.static(path.join(__dirname, "public")));
 const getAppVersion = () => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8")).version || "0.1.0"; } catch { return "0.1.0"; } };
-const getLocalCommit = () => { try { return execFileSync("git", ["rev-parse", "HEAD"], { cwd: __dirname, encoding: "utf8", windowsHide: true }).trim(); } catch { return ""; } };
-const GITHUB_REPO = "oldiron-666/Dflow";
-const GITHUB_BRANCH = "main";
+// The packaged Android build has no .git, so the commit is read from the stamp
+// CI writes into the app tree (see localBuildInfo). Reading it with git alone
+// returned '' there, which made the update check report an update forever.
+const APP_DATA_DIR = process.env.DFLOW_DATA_DIR ? path.resolve(process.env.DFLOW_DATA_DIR) : path.join(__dirname, "data");
+const getLocalBuild = () => localBuildInfo(__dirname, APP_DATA_DIR);
+const getLocalCommit = () => getLocalBuild().commit;
+const GITHUB_REPO = UPSTREAM_REPO;
+const GITHUB_BRANCH = UPSTREAM_BRANCH;
 const VERSION_HEADERS = { "Accept": "application/vnd.github+json", "User-Agent": "DFlow-Version-Checker/1.0" };
 let versionCheckCache = { at: 0, latest: null };
+// Reported by /api/logs/info so a log export can state when this process began.
+const serverStartedAt = new Date().toISOString();
 app.get("/api/version", async (_req, res) => {
   const currentVersion = getAppVersion();
   const currentCommit = getLocalCommit();
@@ -74,31 +184,160 @@ app.get("/api/version", async (_req, res) => {
     }
   }
   const latest = versionCheckCache.latest;
-  const commitChanged = Boolean(latest?.commit && (!currentCommit || latest.commit !== currentCommit));
-  // A GitHub commit is authoritative. This also avoids a false update prompt
-  // if GitHub's package metadata endpoint is briefly behind the commit API.
-  const versionChanged = Boolean(latest?.version && latest.version !== currentVersion && (!latest.commit || latest.commit !== currentCommit));
-  res.json({ ok: true, current: { version: currentVersion, commit: currentCommit }, latest, updateAvailable: commitChanged || versionChanged });
+  const localBuild = getLocalBuild();
+  const comparison = compareBuilds(localBuild, latest);
+  res.json({
+    ok: true,
+    current: {
+      version: currentVersion,
+      commit: localBuild.commit,
+      // Where the commit came from matters to the user: 'unknown' means the
+      // build carries no revision information and nothing can be compared.
+      commitSource: localBuild.source,
+      builtAt: localBuild.builtAt,
+    },
+    latest,
+    state: comparison.state,
+    // Only a *known* difference counts as an update. Treating an unknown local
+    // revision as "behind" is what made the old check prompt on every launch.
+    updateAvailable: comparison.changed,
+    comparisonNote: comparison.state === 'local-unknown'
+      ? '当前构建不含版本信息，无法自动比对；可在设置 → 日志里导出构建信息手动核对。'
+      : '',
+  });
 });
 
-app.post("/api/version/update", async (_req, res) => {
+// Returns instructions instead of performing a pull.
+//
+// The previous implementation ran `git pull origin main`, but `origin` is the
+// user's own fork while the update check reads the upstream repository — so the
+// two never agreed, and pulling could not fetch what the check had found. On the
+// Android build there is no repository at all. Merging upstream into a fork that
+// carries an Android project and server changes is a decision for a person with
+// a keyboard, so this endpoint explains instead of acting.
+app.get("/api/version/upgrade-guide", async (_req, res) => {
+  const localBuild = getLocalBuild();
+  let latest = null;
+  let error = '';
   try {
-    const pullOutput = execFileSync("git", ["pull", "origin", "main"], {
-      cwd: __dirname,
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: 30000
-    });
-    versionCheckCache = { at: 0, latest: null };
-    const currentVersion = getAppVersion();
-    const currentCommit = getLocalCommit();
-    res.json({ ok: true, output: pullOutput, current: { version: currentVersion, commit: currentCommit } });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message || "Git 拉取失败", detail: String(error.stderr || error.stdout || "") });
+    latest = await fetchUpstreamHead();
+  } catch (problem) {
+    error = problem.message || String(problem);
   }
+  const comparison = compareBuilds(localBuild, latest);
+  res.json({
+    ok: !error,
+    error,
+    state: comparison.state,
+    local: localBuild,
+    upstream: latest,
+    guidance: upgradeGuidance(localBuild, latest),
+  });
+});
+
+app.post("/api/version/update", async (req, res) => {
+  // Kept as a POST so the old browser button keeps working, but it no longer
+  // mutates the working tree. It answers with the same guidance the dedicated
+  // endpoint returns.
+  const localBuild = getLocalBuild();
+  let latest = null;
+  try {
+    latest = await fetchUpstreamHead();
+  } catch (error) {
+    return res.status(502).json({
+      ok: false,
+      error: `无法读取上游版本：${error.message}`,
+      current: { version: getAppVersion(), commit: localBuild.commit },
+    });
+  }
+  const comparison = compareBuilds(localBuild, latest);
+  res.json({
+    ok: true,
+    // `performed: false` is honest about what happened: nothing was changed.
+    performed: false,
+    state: comparison.state,
+    updateAvailable: comparison.changed,
+    current: { version: getAppVersion(), commit: localBuild.commit },
+    latest,
+    guidance: upgradeGuidance(localBuild, latest),
+  });
 });
 
 const DATA_DIR = process.env.DFLOW_DATA_DIR ? path.resolve(process.env.DFLOW_DATA_DIR) : path.join(__dirname, "data");
+// ---- helpers for the HTTP MCP transport -------------------------------------
+
+/**
+ * Calls this server's own HTTP API over loopback.
+ *
+ * The MCP tools are expressed in terms of the public API (same as the stdio
+ * tools do), so the HTTP transport routes through here instead of duplicating
+ * queue logic. Loopback means it passes the access-control middleware as a local
+ * request, which is correct: the transport has already authenticated its caller.
+ */
+async function localApiFetch(route, method = 'GET', body, options = {}) {
+  const headers = new Headers(options.headers || {});
+  let payload = options.body;
+  if (body !== undefined) {
+    headers.set('Content-Type', 'application/json');
+    payload = JSON.stringify(body);
+  }
+  const response = await fetch(`http://127.0.0.1:${PORT}${route}`, {
+    method,
+    headers,
+    body: payload,
+    signal: AbortSignal.timeout(options.timeoutMs || 180000),
+  });
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try {
+      const parsed = JSON.parse(await response.clone().text());
+      message = parsed.error || message;
+    } catch { /* non-JSON error body */ }
+    throw new Error(message);
+  }
+  return response;
+}
+
+/**
+ * Reverses an image supplied by an MCP caller using the built-in model.
+ *
+ * Returns null when no model is configured, which is how the tool decides to hand
+ * the image back for the caller's own model instead of failing.
+ */
+async function builtinReverseForMcp({ bytes, mimeType, reversePreset, expansionPreset, customInstruction }) {
+  if (!isAiConfigured(sharedState.account)) return null;
+  const raw = await reverseWithAi({
+    baseUrl: sharedState.account.aiBaseUrl,
+    apiKey: sharedState.account.aiApiKey,
+    model: sharedState.account.aiModel,
+    temperature: sharedState.account.aiTemperature,
+    maxTokens: sharedState.account.aiMaxTokens,
+    imageBytes: bytes,
+    imageMimeType: mimeType,
+    instruction: buildAiInstruction({ reversePreset, expansionPreset, customInstruction }),
+  });
+  return { prompt: cleanAiPrompt(raw) };
+}
+
+/**
+ * Non-loopback addresses this device currently holds.
+ *
+ * Used to show the user the exact URL to paste into another machine; guessing or
+ * hiding it behind "check your IP" is the usual reason remote setup fails.
+ */
+function localAddresses() {
+  const result = [];
+  try {
+    for (const entries of Object.values(os.networkInterfaces())) {
+      for (const entry of entries || []) {
+        if (entry.internal || entry.family !== 'IPv4') continue;
+        result.push(entry.address);
+      }
+    }
+  } catch { /* no interfaces readable */ }
+  return result;
+}
+
 const localThumbnail = createThumbnailCache(path.join(DATA_DIR, 'thumbnails'));
 const STATE_FILE = path.join(DATA_DIR, "dflow-state.json");
 const REVERSE_DIR = path.join(DATA_DIR, "reverse");
@@ -441,7 +680,14 @@ const defaultSharedState = () => ({
     aiTemperature: 0.7,
     aiMaxTokens: 2048,
     // Appended to every built-in reverse request, on top of the presets.
-    aiCustomInstruction: ""
+    aiCustomInstruction: "",
+    // Remote access. Disabled by default: exposing a gallery that holds the
+    // user's credentials and private images must be a deliberate act.
+    apiEnabled: false,
+    // Generated on first enable; kept so a client only has to be set up once.
+    apiToken: "",
+    // Whether a token is required. Turning it off is allowed, with a warning.
+    apiRequireToken: true
   },
   favorites: [],
   preferences: { mode: "latest", columns: 5, ratings: ["g", "s", "q", "e"], pixivRating: "safe", pixivDates: {}, search: "", selectedTags: [] },
@@ -947,11 +1193,101 @@ app.post('/api/translate-test', async (req, res) => {
   }
 });
 
-app.get("/api/state", (_req, res) => {
+app.get("/api/state", (req, res) => {
   if (reconcileFavoriteCaches()) writeSharedState();
   renumberAllPendingQueue();
   for (const item of sharedState.favorites) if (item.cacheStatus === "idle") scheduleCache(item.id);
-  res.json(sharedState);
+  res.json(redactState(sharedState, req));
+});
+
+// ---- diagnostics -----------------------------------------------------------
+
+/**
+ * Log files and build facts, for the in-app export action.
+ *
+ * Secret values are deliberately excluded: this response is meant to be attached
+ * to a bug report. Only lengths/presence of credentials are reported, which is
+ * enough to tell "configured" from "not configured" without leaking anything.
+ */
+app.get('/api/logs/info', (_req, res) => {
+  const directory = logDirectory();
+  let files = [];
+  try {
+    files = fs.readdirSync(directory)
+      .filter(name => name.startsWith('server.log'))
+      .map(name => {
+        const full = path.join(directory, name);
+        const stat = fs.statSync(full);
+        return { name, size: stat.size, modifiedAt: stat.mtime.toISOString() };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    // No logs yet is a normal state on a fresh install.
+  }
+  const build = getLocalBuild();
+  res.json({
+    ok: true,
+    directory,
+    files,
+    totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+    version: getAppVersion(),
+    commit: build.commit,
+    commitSource: build.source,
+    node: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    startedAt: serverStartedAt,
+    uptimeSeconds: Math.round(process.uptime()),
+    account: {
+      danbooru: Boolean(sharedState.account.loginName && sharedState.account.loginKey),
+      pixiv: Boolean(sharedState.account.pixivCookie),
+      proxy: sharedState.account.proxyUrl || '',
+      aiConfigured: isAiConfigured(sharedState.account),
+      aiModel: sharedState.account.aiModel || '',
+    },
+  });
+});
+
+/** Returns the log text, newest last, capped so the response stays readable. */
+app.get('/api/logs/text', (req, res) => {
+  const maxBytes = Math.min(Math.max(Number(req.query.bytes) || 512 * 1024, 4096), 8 * 1024 * 1024);
+  const directory = logDirectory();
+  let names = [];
+  try {
+    names = fs.readdirSync(directory).filter(name => name.startsWith('server.log')).sort();
+  } catch {
+    names = [];
+  }
+  // Read newest-last so the tail of the output is the most recent activity.
+  const ordered = names.sort((a, b) => {
+    const index = name => (name === 'server.log' ? Number.MAX_SAFE_INTEGER : Number(name.split('.').pop()) || 0);
+    return index(a) - index(b);
+  });
+  let content = ordered
+    .map(name => {
+      try { return fs.readFileSync(path.join(directory, name), 'utf8'); } catch { return ''; }
+    })
+    .join('');
+  if (Buffer.byteLength(content) > maxBytes) {
+    content = content.slice(-maxBytes);
+    const firstBreak = content.indexOf('\n');
+    if (firstBreak >= 0) content = content.slice(firstBreak + 1);
+  }
+  res.type('text/plain; charset=utf-8').send(content);
+});
+
+app.delete('/api/logs', (_req, res) => {
+  const directory = logDirectory();
+  const removed = [];
+  try {
+    for (const name of fs.readdirSync(directory)) {
+      if (!name.startsWith('server.log')) continue;
+      try { fs.rmSync(path.join(directory, name), { force: true }); removed.push(name); } catch { /* ignore */ }
+    }
+  } catch {
+    // Nothing to clear.
+  }
+  res.json({ ok: true, removed });
 });
 app.put("/api/account", (req, res) => {
   const body = req.body || {};
@@ -978,7 +1314,16 @@ app.put("/api/account", (req, res) => {
     aiModel: String(body.aiModel ?? sharedState.account.aiModel ?? "").trim(),
     aiTemperature: normalizeAiNumber(body.aiTemperature, sharedState.account.aiTemperature, 0, 2),
     aiMaxTokens: normalizeAiNumber(body.aiMaxTokens, sharedState.account.aiMaxTokens, 256, 32000),
-    aiCustomInstruction: String(body.aiCustomInstruction ?? sharedState.account.aiCustomInstruction ?? "").slice(0, 4000)
+    aiCustomInstruction: String(body.aiCustomInstruction ?? sharedState.account.aiCustomInstruction ?? "").slice(0, 4000),
+    apiEnabled: body.apiEnabled !== undefined ? Boolean(body.apiEnabled) : Boolean(sharedState.account.apiEnabled),
+    // Like the AI key: replaced only when the client actually sends a value,
+    // so a settings screen that never receives the token cannot wipe it.
+    apiToken: body.apiToken !== undefined
+      ? String(body.apiToken).trim().slice(0, 200)
+      : (sharedState.account.apiToken || ""),
+    apiRequireToken: body.apiRequireToken !== undefined
+      ? Boolean(body.apiRequireToken)
+      : sharedState.account.apiRequireToken !== false
   };
   writeSharedState();
   // A changed proxy takes effect immediately, without a service restart.
@@ -2154,6 +2499,24 @@ app.post('/api/ai/reverse-batch', async (req, res) => {
 
 app.get('/api/ai/batch', (_req, res) => res.json(aiBatch));
 
+/**
+ * Reports whether the built-in vision model is usable.
+ *
+ * Callers (the MCP reverse tool in particular) need this before deciding how to
+ * handle an image: with a model configured DFlow can return a finished prompt;
+ * without one it must hand the image back for the caller's own model to read.
+ * Only the model name is exposed, never the key.
+ */
+app.get('/api/ai/capability', (_req, res) => {
+  res.json({
+    configured: isAiConfigured(sharedState.account),
+    model: sharedState.account.aiModel || '',
+    baseUrl: sharedState.account.aiBaseUrl || '',
+    busy: aiBatch.running,
+    runningIds: [...activeAiJobs.keys()],
+  });
+});
+
 app.post('/api/ai/batch/stop', (_req, res) => {
   aiBatch.running = false;
   for (const controller of activeAiJobs.values()) controller.abort();
@@ -2854,6 +3217,66 @@ app.delete('/api/metadata/images/:id',(req,res)=>{
   const old=list.find(x=>x.id===req.params.id);try { fs.unlinkSync(path.join(META_DIR,req.params.id+'.'+(old.imageExt||'png'))); } catch {}
   res.json({ok:true});
 });
+// ---- MCP over HTTP ---------------------------------------------------------
+//
+// The stdio MCP server only runs on the machine that launched it, so a phone
+// could never be driven by a remote agent. Mounting the same tools over HTTP
+// fixes that, gated by the access-control middleware above.
+
+const mcpConfig = () => ({
+  enabled: Boolean(sharedState.account.apiEnabled),
+  requireToken: sharedState.account.apiRequireToken !== false,
+  token: String(sharedState.account.apiToken || ''),
+});
+
+// The handler needs a reverse callback only when it runs on this machine with a
+// model configured; remote callers otherwise receive the image plus instructions.
+const mcpHandler = createMcpHandler({
+  json: async (route, method = 'GET', body) => {
+    const response = await localApiFetch(route, method, body);
+    return response.json();
+  },
+  raw: (route, options = {}) => localApiFetch(route, options.method || 'GET', undefined, options),
+  version: getAppVersion(),
+  getConfig: () => ({ ...mcpConfig(), reverse: builtinReverseForMcp }),
+});
+
+app.post('/mcp', createAuthMiddleware(mcpConfig), (req, res) => mcpHandler(req, res));
+app.get('/mcp', createAuthMiddleware(mcpConfig), (req, res) => {
+  // A bare GET on the streamable endpoint is only meaningful for server-sent
+  // events, which this stateless setup does not offer. Answering clearly beats
+  // letting the transport return an opaque error.
+  res.status(405).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: '此端点使用 POST 发送 JSON-RPC；本机未提供 SSE 推送。' },
+    id: null,
+  });
+});
+app.delete('/mcp', createAuthMiddleware(mcpConfig), (_req, res) => res.status(204).end());
+
+/** Connection details for the settings screen and for copy-paste client setup. */
+app.get('/api/api-access', (req, res) => {
+  if (!isLoopback(req)) return res.status(403).json({ error: '只能在本机查看连接信息' });
+  res.json({
+    ok: true,
+    ...connectionInfo({
+      addresses: localAddresses(),
+      port: PORT,
+      requireToken: sharedState.account.apiRequireToken !== false,
+      token: String(sharedState.account.apiToken || ''),
+      enabled: Boolean(sharedState.account.apiEnabled),
+    }),
+  });
+});
+
+/** Generates a fresh token, invalidating whatever a client was configured with. */
+app.post('/api/api-access/token', (req, res) => {
+  if (!isLoopback(req)) return res.status(403).json({ error: '只能在本机操作' });
+  sharedState.account.apiToken = crypto.randomBytes(24).toString('hex');
+  writeSharedState();
+  res.json({ ok: true, token: sharedState.account.apiToken });
+});
+
 app.use("/api", (_req, res) => res.status(404).json({ok:false, error:"接口不存在，请确认已重启到最新版 DFlow 服务"}));
 app.use((_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 app.listen(PORT, HOST, () => console.log(`DFlow 已启动：http://${HOST}:${PORT}`));

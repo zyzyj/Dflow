@@ -45,6 +45,15 @@ class RuntimePaths(context: Context) {
 class ProotLauncher(
     private val paths: RuntimePaths,
     private val port: Int,
+    /**
+     * Address the embedded server listens on.
+     *
+     * 127.0.0.1 keeps the gallery private to the phone. 0.0.0.0 exposes it to the
+     * LAN, which is what lets another machine drive the reverse queue — and also
+     * what makes the server's access-control middleware load-bearing rather than
+     * decorative.
+     */
+    private val host: String,
     private val onLog: (String) -> Unit,
 ) {
     private var process: Process? = null
@@ -100,10 +109,13 @@ class ProotLauncher(
         put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         put("TERM", "xterm-256color")
         put("LANG", "C.UTF-8")
-        // DFlow reads these: where to keep state, and which port to listen on.
+        // DFlow reads these: where to keep state, and which interface/port to listen on.
         put("DFLOW_DATA_DIR", "/root/dflow-data")
         put("PORT", port.toString())
-        put("HOST", "127.0.0.1")
+        put("HOST", host)
+        // The server writes its own log here, so an export from inside the app
+        // contains both the host output and the server's own errors.
+        put("DFLOW_LOG_DIR", "/root/dflow-data/logs")
     }
 
     /** Starts the guest and blocks (off the main thread) until the port answers. */
