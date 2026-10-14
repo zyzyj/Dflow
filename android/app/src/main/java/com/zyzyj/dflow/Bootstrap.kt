@@ -54,13 +54,11 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         staged.deleteRecursively()
         staged.mkdirs()
 
-        copyAssetStream(ASSET_ROOTFS).use { stream ->
-            TarExtractor.extractTarGz(
-                archive = streamAsFile(stream, "rootfs.tar.gz"),
-                destination = staged,
-                onProgress = { bytes -> onProgress(Progress("正在解压运行环境", bytes)) },
-            )
-        }
+        TarExtractor.extractArchive(
+            archive = materialiseAsset(ASSET_ROOTFS),
+            destination = staged,
+            onProgress = { bytes -> onProgress(Progress("正在解压运行环境", bytes)) },
+        )
 
         val from = File(staged, "rootfs")
         val source = if (from.isDirectory) from else staged
@@ -77,14 +75,11 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         staged.deleteRecursively()
         staged.mkdirs()
 
-        copyAssetStream(ASSET_APP).use { stream ->
-            TarExtractor.extractTarGz(
-                archive = streamAsFile(stream, "app.tar.gz"),
-                destination = staged,
-                onProgress = { bytes -> onProgress(Progress("正在安装应用文件", bytes)) },
-            )
-        }
-        File(context.cacheDir, "app.tar.gz").delete()
+        TarExtractor.extractArchive(
+            archive = materialiseAsset(ASSET_APP),
+            destination = staged,
+            onProgress = { bytes -> onProgress(Progress("正在安装应用文件", bytes)) },
+        )
 
         // The tar is rooted at "app/", so prefer that nested directory.
         val inner = File(staged, "app")
@@ -153,26 +148,27 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         return (get.invoke(null, name) as? String).orEmpty()
     }
 
-    private fun copyAssetStream(name: String) =
-        context.assets.open(name, android.content.res.AssetManager.ACCESS_STREAMING)
-
     /**
-     * TarExtractor wants random access to the archive, but assets are delivered
-     * as a stream. Copying to a temp file keeps the extractor simple and stays
-     * within internal storage, which is fast.
+     * Resolves an asset and copies it to a real file.
      *
-     * The copy is removed afterwards rather than cached: a cached file would go
-     * stale the next time the APK ships a newer rootfs, and the archives are
-     * large enough that keeping a second copy is wasteful.
+     * aapt2 decompresses `.gz` assets and drops the suffix, so the shipped name
+     * may be either `rootfs.tar.gz` or `rootfs.tar`. Both are probed rather
+     * than assumed, because a wrong guess costs the user a failed first launch.
      */
-    private fun streamAsFile(stream: java.io.InputStream, baseName: String): File {
-        val temp = File(context.cacheDir, baseName)
-        temp.delete()
-        stream.use { input ->
-            temp.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
+    private fun materialiseAsset(baseName: String): File {
+        val candidates = listOf(baseName, baseName.removeSuffix(".gz"))
+        val temp = File(context.cacheDir, "asset.tmp")
+        for (name in candidates) {
+            val stream = runCatching {
+                context.assets.open(name, android.content.res.AssetManager.ACCESS_STREAMING)
+            }.getOrNull() ?: continue
+            temp.delete()
+            stream.use { input ->
+                temp.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
+            }
+            if (temp.length() > 0) return temp
         }
-        if (temp.length() == 0L) throw IOException("Asset $baseName is empty or missing")
-        return temp
+        throw IOException("缺少资源文件：${candidates.joinToString(" 或 ")}")
     }
 
     private fun File.copyRecursivelyInto(target: File) {

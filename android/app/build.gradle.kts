@@ -60,9 +60,11 @@ android {
     }
 
     androidResources {
-        // Keep the pre-compressed archives untouched so the app can stream them
-        // straight into a decompressor.
-        noCompress += listOf("gz", "xz", "tar")
+        // Assets must survive packaging byte-for-byte: aapt strips the .gz
+        // extension and decompresses archives it recognises, which would leave
+        // a bare .tar whose name the Kotlin extractor does not expect. Listing
+        // the extensions keeps the archives intact.
+        noCompress += listOf("gz", "xz", "tar", "tgz")
     }
 }
 

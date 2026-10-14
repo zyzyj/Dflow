@@ -27,13 +27,38 @@ object TarExtractor {
 
     private const val BLOCK = 512
 
-    /** Extracts a .tar.gz into [destination], replacing any previous contents. */
-    fun extractTarGz(archive: File, destination: File, onProgress: (Long) -> Unit = {}) {
+    /** gzip magic number; a bare tar starts with a file name instead. */
+    private val GZIP_MAGIC = byteArrayOf(0x1f, 0x8b.toByte())
+
+    /**
+     * Extracts an archive that may be either .tar or .tar.gz.
+     *
+     * The format is detected from the file itself rather than from the name,
+     * because aapt2 decompresses `.gz` assets during packaging and strips the
+     * suffix: the archive arrives as `rootfs.tar` holding an uncompressed tar.
+     * Sniffing the magic bytes works either way, so the build can rename or
+     * re-compress the asset without breaking the app.
+     */
+    fun extractArchive(archive: File, destination: File, onProgress: (Long) -> Unit = {}) {
+        val isGzip = archive.inputStream().use { input ->
+            val head = ByteArray(2)
+            val read = input.read(head)
+            read == 2 && head[0] == GZIP_MAGIC[0] && head[1] == GZIP_MAGIC[1]
+        }
         BufferedInputStream(archive.inputStream(), 1 shl 16).use { fileIn ->
-            GZIPInputStream(fileIn, 1 shl 16).use { gz ->
-                extractTar(gz, destination, onProgress)
+            if (isGzip) {
+                GZIPInputStream(fileIn, 1 shl 16).use { gz ->
+                    extractTar(gz, destination, onProgress)
+                }
+            } else {
+                extractTar(fileIn, destination, onProgress)
             }
         }
+    }
+
+    /** Extracts a .tar.gz into [destination], replacing any previous contents. */
+    fun extractTarGz(archive: File, destination: File, onProgress: (Long) -> Unit = {}) {
+        extractArchive(archive, destination, onProgress)
     }
 
     private fun extractTar(input: InputStream, destination: File, onProgress: (Long) -> Unit) {
