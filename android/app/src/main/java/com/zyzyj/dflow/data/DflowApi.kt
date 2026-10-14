@@ -46,8 +46,20 @@ class DflowApi(private val port: Int) {
 
     private fun url(path: String) = baseUrl + path
 
-    private fun execute(request: Request): String {
-        client.newCall(request).execute().use { response ->
+    /**
+     * Sends a request and returns its body.
+     *
+     * [callTimeoutSeconds] overrides the shared client's timeouts for this one
+     * call. OkHttp applies a per-call timeout when one is set, which is how a
+     * multi-minute model call can coexist with the short default used everywhere
+     * else.
+     */
+    private fun execute(request: Request, callTimeoutSeconds: Long = 0): String {
+        val call = client.newCall(request)
+        if (callTimeoutSeconds > 0) {
+            call.timeout().timeout(callTimeoutSeconds, TimeUnit.SECONDS)
+        }
+        call.execute().use { response ->
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 // The server answers errors with {"error":...,"detail":...}; fall
@@ -102,14 +114,21 @@ class DflowApi(private val port: Int) {
         }
     }
 
-    private suspend fun postRaw(path: String, jsonBody: String): String = withContext(Dispatchers.IO) {
+    private suspend fun postRaw(
+        path: String,
+        jsonBody: String,
+        callTimeoutSeconds: Long = 0,
+    ): String = withContext(Dispatchers.IO) {
         try {
-            execute(
-                Request.Builder()
-                    .url(url(path))
-                    .post(jsonBody.toRequestBody(JSON_MEDIA))
-                    .build()
-            )
+            val request = Request.Builder()
+                .url(url(path))
+                .post(jsonBody.toRequestBody(JSON_MEDIA))
+                .build()
+            // A vision model can take minutes on a large image, far beyond the
+            // shared client's read timeout. Without a per-call override the
+            // request is killed mid-generation and surfaces as a generic network
+            // error, which makes a slow model look like a broken one.
+            execute(request, callTimeoutSeconds)
         } catch (e: ApiException) {
             throw e
         } catch (e: IOException) {
@@ -237,12 +256,41 @@ class DflowApi(private val port: Int) {
     /**
      * Connected MCP agents.
      *
-     * Reverse-prompting is performed by an external agent that reads the image
-     * and writes the prompt back; the server only queues and stores. This tells
-     * the UI whether handing a card off can work at all, so the button can be
+     * Reverse-prompting is done by an external agent that reads the image and
+     * writes the prompt back; the server only queues and stores. This tells the
+     * UI whether handing a card off can work at all, so the button can be
      * disabled with a reason instead of failing on tap.
      */
     suspend fun mcpSessions(): List<McpSession> = get("/api/mcp/sessions")
+
+    // ---- built-in vision reverse ------------------------------------------
+
+    /** Lists models offered by the configured endpoint. */
+    suspend fun aiModels(baseUrl: String, apiKey: String): List<String> =
+        postRaw("/api/ai/models", "{\"aiBaseUrl\":${quote(baseUrl)},\"aiApiKey\":${quote(apiKey)}}")
+            .let { json.decodeFromString<AiModelList>(it).models }
+
+    /** Reverses one card with the built-in model. Long-running: a vision call
+     *  on a large image can take a while. */
+    suspend fun aiReverse(id: String): AiReverseResult =
+        postRaw("/api/ai/reverse/${encode(id)}", "{}", callTimeoutSeconds = AI_CALL_TIMEOUT_SECONDS)
+            .let { json.decodeFromString(it) }
+
+    /**
+     * Progress of a running built-in reverse, polled while the request is in
+     * flight so the user sees the prompt being written instead of a spinner.
+     */
+    suspend fun aiProgress(id: String): AiProgress =
+        get("/api/ai/progress/${encode(id)}")
+
+    suspend fun aiCancel(id: String): String = postRaw("/api/ai/cancel/${encode(id)}", "{}")
+
+    suspend fun aiReverseBatch(): AiBatchStart =
+        postRaw("/api/ai/reverse-batch", "{}").let { json.decodeFromString(it) }
+
+    suspend fun aiBatch(): AiBatch = get("/api/ai/batch")
+
+    suspend fun aiStopBatch(): String = postRaw("/api/ai/batch/stop", "{}")
 
     suspend fun updateAccount(account: Account): String =
         putRaw("/api/account", json.encodeToString(Account.serializer(), account))
@@ -280,6 +328,14 @@ class DflowApi(private val port: Int) {
 
     private companion object {
         val JSON_MEDIA = "application/json".toMediaType()
+
+        /**
+         * Ceiling for one built-in reverse call.
+         *
+         * Chosen to outlast a slow vision model on a large image while still
+         * failing eventually; the user can cancel earlier from the UI.
+         */
+        const val AI_CALL_TIMEOUT_SECONDS = 600L
     }
 }
 

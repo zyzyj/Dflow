@@ -3,6 +3,7 @@ package com.zyzyj.dflow.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.zyzyj.dflow.data.Account
+import com.zyzyj.dflow.data.AiBatch
 import com.zyzyj.dflow.data.AppState
 import com.zyzyj.dflow.data.DflowApi
 import com.zyzyj.dflow.data.Favorite
@@ -12,6 +13,8 @@ import com.zyzyj.dflow.data.Post
 import com.zyzyj.dflow.data.PresetLibrary
 import com.zyzyj.dflow.data.Tag
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -77,6 +80,31 @@ data class SettingsUiState(
 )
 
 /**
+ * State of the built-in vision reverse page.
+ *
+ * Kept apart from [SettingsUiState] because it has its own lifecycle: the model
+ * list is fetched on demand, and a running reverse produces streaming progress
+ * that must not re-render the whole settings screen.
+ */
+data class AiUiState(
+    val baseUrl: String = "",
+    val apiKey: String = "",
+    val model: String = "",
+    val temperature: Float = 0.7f,
+    val maxTokens: Int = 2048,
+    val customInstruction: String = "",
+    val models: List<String> = emptyList(),
+    val fetchingModels: Boolean = false,
+    val modelsError: String? = null,
+    /** Live text of the card being reversed, for progress display. */
+    val progressText: String = "",
+    val progressId: String = "",
+    val batch: AiBatch = AiBatch(),
+) {
+    val configured: Boolean get() = baseUrl.isNotBlank() && model.isNotBlank()
+}
+
+/**
  * Holds screen state and talks to the embedded server.
  *
  * One view model for the whole app because every screen reads from the same
@@ -94,7 +122,12 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
     private val _settings = MutableStateFlow(SettingsUiState())
     val settings: StateFlow<SettingsUiState> = _settings.asStateFlow()
 
+    private val _ai = MutableStateFlow(AiUiState())
+    val ai: StateFlow<AiUiState> = _ai.asStateFlow()
+
     private var browseJob: Job? = null
+    private var batchPollJob: Job? = null
+    private var progressPollJob: Job? = null
 
     // ---- browsing ----------------------------------------------------------
 
@@ -372,6 +405,7 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
                 )
             }
             _library.update { s -> if (state != null) s.copy(favorites = state.favorites) else s }
+            loadAiSettings()
         }
     }
 
@@ -412,6 +446,195 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
 
     fun consumeMessage() {
         _settings.update { it.copy(message = null) }
+    }
+
+    // ---- built-in AI reverse ----------------------------------------------
+
+    /** Loads the AI fields from the server into the editable page state. */
+    fun loadAiSettings() {
+        val account = _settings.value.state.account
+        _ai.update {
+            it.copy(
+                baseUrl = account.aiBaseUrl,
+                apiKey = account.aiApiKey,
+                model = account.aiModel,
+                temperature = account.aiTemperature.toFloat(),
+                maxTokens = account.aiMaxTokens,
+                customInstruction = account.aiCustomInstruction,
+            )
+        }
+    }
+
+    fun updateAiFields(
+        baseUrl: String? = null,
+        apiKey: String? = null,
+        model: String? = null,
+        temperature: Float? = null,
+        maxTokens: Int? = null,
+        customInstruction: String? = null,
+    ) {
+        _ai.update {
+            it.copy(
+                baseUrl = baseUrl ?: it.baseUrl,
+                apiKey = apiKey ?: it.apiKey,
+                model = model ?: it.model,
+                temperature = temperature ?: it.temperature,
+                maxTokens = maxTokens ?: it.maxTokens,
+                customInstruction = customInstruction ?: it.customInstruction,
+            )
+        }
+    }
+
+    /** Persists the AI fields onto the account (other fields are left as-is). */
+    private suspend fun persistAi() {
+        val current = _ai.value
+        val account = _settings.value.state.account.copy(
+            aiBaseUrl = current.baseUrl.trim(),
+            aiApiKey = current.apiKey.trim(),
+            aiModel = current.model.trim(),
+            aiTemperature = current.temperature.toDouble(),
+            aiMaxTokens = current.maxTokens,
+            aiCustomInstruction = current.customInstruction,
+        )
+        api.updateAccount(account)
+        _settings.update { it.copy(state = it.state.copy(account = account)) }
+    }
+
+    /**
+     * Fetches the model list.
+     *
+     * Saves first: the endpoint and key live on the server, and the request is
+     * made by the server (the phone has no direct access to the user's LAN or
+     * to a loopback service on another machine).
+     */
+    fun fetchAiModels() {
+        _ai.update { it.copy(fetchingModels = true, modelsError = null) }
+        viewModelScope.launch {
+            try {
+                persistAi()
+                val models = api.aiModels(_ai.value.baseUrl, _ai.value.apiKey)
+                _ai.update { it.copy(fetchingModels = false, models = models) }
+                if (models.isEmpty()) {
+                    _settings.update { it.copy(message = "该地址没有返回任何模型", messageIsError = true) }
+                } else if (_ai.value.model.isBlank()) {
+                    // Preselect the first entry so a single tap on 保存 is enough.
+                    _ai.update { it.copy(model = models.first()) }
+                }
+            } catch (e: DflowApi.ApiException) {
+                _ai.update { it.copy(fetchingModels = false, modelsError = e.message) }
+            }
+        }
+    }
+
+    fun saveAiSettings() {
+        viewModelScope.launch {
+            try {
+                persistAi()
+                _settings.update { it.copy(message = "AI 配置已保存", messageIsError = false) }
+            } catch (e: DflowApi.ApiException) {
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
+
+    /**
+     * Reverses one card with the built-in model, streaming progress into the
+     * page state so the user can watch the prompt being written.
+     */
+    fun aiReverse(favorite: Favorite) {
+        val id = favorite.id
+        _ai.update { it.copy(progressId = id, progressText = "") }
+        pollProgress(id)
+        viewModelScope.launch {
+            try {
+                api.aiReverse(id)
+                _settings.update { it.copy(message = "反推完成", messageIsError = false) }
+                refreshLibrary()
+            } catch (e: DflowApi.ApiException) {
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+                refreshLibrary()
+            } finally {
+                progressPollJob?.cancel()
+                _ai.update { it.copy(progressId = "", progressText = "") }
+            }
+        }
+    }
+
+    fun aiCancel(id: String) {
+        viewModelScope.launch {
+            runCatching { api.aiCancel(id) }
+            progressPollJob?.cancel()
+            _ai.update { it.copy(progressId = "", progressText = "") }
+        }
+    }
+
+    private fun pollProgress(id: String) {
+        progressPollJob?.cancel()
+        progressPollJob = viewModelScope.launch {
+            // The request may not have reached the server yet on the first tick, so
+            // "not running yet" must not be read as "already finished" — otherwise
+            // the poll gives up before the job starts and no progress is ever shown.
+            // Only stop once the job has actually been observed running and then
+            // stopped; the caller cancels this on completion anyway.
+            var sawRunning = false
+            while (isActive) {
+                delay(700)
+                val state = runCatching { api.aiProgress(id) }.getOrNull()
+                if (state == null) continue
+                if (state.running) sawRunning = true
+                _ai.update { it.copy(progressText = state.text) }
+                if (sawRunning && !state.running) return@launch
+            }
+        }
+    }
+
+    /** Reverses every eligible pending card, one at a time. */
+    fun aiReverseAll() {
+        viewModelScope.launch {
+            try {
+                val start = api.aiReverseBatch()
+                _ai.update { it.copy(batch = AiBatch(running = true, total = start.total)) }
+                _settings.update {
+                    it.copy(message = "已开始批量反推，共 ${start.total} 张", messageIsError = false)
+                }
+                pollBatch()
+            } catch (e: DflowApi.ApiException) {
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
+
+    fun aiStopBatch() {
+        viewModelScope.launch {
+            runCatching { api.aiStopBatch() }
+            pollBatch()
+        }
+    }
+
+    private fun pollBatch() {
+        batchPollJob?.cancel()
+        batchPollJob = viewModelScope.launch {
+            while (true) {
+                val state = runCatching { api.aiBatch() }.getOrNull()
+                if (state != null) {
+                    _ai.update { it.copy(batch = state) }
+                    if (!state.running) {
+                        refreshLibrary()
+                        val failed = state.failed
+                        _settings.update {
+                            it.copy(
+                                message = if (failed > 0)
+                                    "批量反推结束：成功 ${state.done} 张，失败 $failed 张"
+                                else "批量反推完成，共 ${state.done} 张",
+                                messageIsError = failed > 0,
+                            )
+                        }
+                        return@launch
+                    }
+                }
+                kotlinx.coroutines.delay(1200)
+            }
+        }
     }
 
     /**

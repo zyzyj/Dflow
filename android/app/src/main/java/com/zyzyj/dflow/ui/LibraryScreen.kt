@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
@@ -58,12 +59,15 @@ import com.zyzyj.dflow.data.McpSession
 fun LibraryScreen(
     state: LibraryUiState,
     favoriteIds: Set<String>,
+    aiConfigured: Boolean,
+    batchRunning: Boolean,
     onFolderChange: (LibraryFolder) -> Unit,
     onOpen: (Favorite, Int) -> Unit,
     onCopyPrompt: (Favorite) -> Unit,
     onEditPrompt: (Favorite) -> Unit,
     onEnqueue: (Favorite) -> Unit,
     onDirectReverse: (Favorite) -> Unit,
+    onLocalReverse: (Favorite) -> Unit,
     onRelease: (Favorite) -> Unit,
     onRestore: (Favorite) -> Unit,
     onRetryCache: (Favorite) -> Unit,
@@ -74,30 +78,44 @@ fun LibraryScreen(
     val visible = state.favorites
         .filter { it.folder == state.folder.key }
         .sortedWith(comparatorFor(state.folder))
+    val hasAgents = state.agents.isNotEmpty()
     val counts = LibraryFolder.entries.associateWith { folder ->
         state.favorites.count { it.folder == folder.key }
     }
 
     Column(modifier.fillMaxSize()) {
-        // Reverse-prompting is done by an external agent, not by the phone. When
-        // none is connected the whole pipeline stalls, so say so up front rather
-        // than let each button fail individually.
-        if (state.agents.isEmpty()) {
-            Surface(
+        // Reverse-prompting can come from two places now. The built-in model runs
+        // entirely in the app; the MCP route needs an agent elsewhere. Say which
+        // is available instead of leaving the user to guess why a button is dead.
+        when {
+            aiConfigured -> Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text(
+                    text = if (batchRunning) "正在批量反推…可在「反推」页查看进度"
+                    else "内置 AI 可用，待反推卡片可直接点「识别」自动反推" +
+                        if (state.agents.isNotEmpty()) "；也已连接 ${state.agents.size} 个外部 Agent" else "",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.padding(10.dp),
+                )
+            }
+            state.agents.isEmpty() -> Surface(
                 color = MaterialTheme.colorScheme.tertiaryContainer,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
                 shape = RoundedCornerShape(10.dp),
             ) {
                 Text(
-                    text = "没有在线的 AI Agent。「直推」需要外部 Agent 读取原图并写回提示词；" +
-                        "你仍可手动编辑提示词，或在电脑上连接本机 MCP 后自动反推。",
+                    text = "还没配置 AI。到「反推」页填一个视觉模型接口，就能在手机上自动反推；" +
+                        "也可以手动编辑提示词，或在电脑上连接本机 MCP 由 Agent 处理。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onTertiaryContainer,
                     modifier = Modifier.padding(10.dp),
                 )
             }
-        } else {
-            Surface(
+            else -> Surface(
                 color = MaterialTheme.colorScheme.secondaryContainer,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
                 shape = RoundedCornerShape(10.dp),
@@ -148,11 +166,15 @@ fun LibraryScreen(
                         FavoriteCard(
                             favorite = favorite,
                             imageUrl = imageUrl(favorite),
+                            aiConfigured = aiConfigured,
+                            batchRunning = batchRunning,
+                            agentsAvailable = hasAgents,
                             onOpen = { onOpen(favorite, visible.indexOf(favorite)) },
                             onCopyPrompt = { onCopyPrompt(favorite) },
                             onEditPrompt = { onEditPrompt(favorite) },
                             onEnqueue = { onEnqueue(favorite) },
                             onDirectReverse = { onDirectReverse(favorite) },
+                            onLocalReverse = { onLocalReverse(favorite) },
                             onRelease = { onRelease(favorite) },
                             onRestore = { onRestore(favorite) },
                             onRetryCache = { onRetryCache(favorite) },
@@ -185,11 +207,15 @@ private fun hintFor(folder: LibraryFolder): String = when (folder) {
 private fun FavoriteCard(
     favorite: Favorite,
     imageUrl: String?,
+    aiConfigured: Boolean,
+    batchRunning: Boolean,
+    agentsAvailable: Boolean,
     onOpen: () -> Unit,
     onCopyPrompt: () -> Unit,
     onEditPrompt: () -> Unit,
     onEnqueue: () -> Unit,
     onDirectReverse: () -> Unit,
+    onLocalReverse: () -> Unit,
     onRelease: () -> Unit,
     onRestore: () -> Unit,
     onRetryCache: () -> Unit,
@@ -253,7 +279,20 @@ private fun FavoriteCard(
                         CardAction("AI", Icons.Filled.AutoAwesome, "加入待反推", onEnqueue)
                     }
                     "pending" -> {
-                        CardAction("直推", Icons.Filled.AutoAwesome, "交给在线 Agent", onDirectReverse)
+                        // Two ways to reverse, and they are not interchangeable:
+                        // 「识别」runs the built-in model here; 「直推」hands the card
+                        // to an external agent. Both are shown when both are available
+                        // so the user picks deliberately.
+                        CardAction(
+                            label = "识别",
+                            icon = Icons.Filled.AutoAwesome,
+                            description = if (aiConfigured) "用内置模型反推" else "需要先配置 AI",
+                            onClick = onLocalReverse,
+                            enabled = aiConfigured && !batchRunning && favorite.isCached,
+                        )
+                        if (agentsAvailable) {
+                            CardAction("直推", Icons.AutoMirrored.Filled.Send, "交给在线 Agent", onDirectReverse)
+                        }
                         if (!favorite.isCached) {
                             CardAction("重下", Icons.Filled.Refresh, "重新下载原图", onRetryCache)
                         }
@@ -279,23 +318,26 @@ private fun CardAction(
     icon: ImageVector,
     description: String,
     onClick: () -> Unit,
+    enabled: Boolean = true,
 ) {
+    val tint = if (enabled) MaterialTheme.colorScheme.primary
+    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 6.dp),
     ) {
         Icon(
             icon,
             contentDescription = description,
-            tint = MaterialTheme.colorScheme.primary,
+            tint = tint,
             modifier = Modifier.size(18.dp),
         )
         Text(
             label,
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = tint,
         )
     }
 }

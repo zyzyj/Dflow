@@ -180,6 +180,17 @@ jobs:
           set -eux
           python3 android/tools/simulate-bootstrap.py app-assets/rootfs.tar.gz app-assets/app.tar.gz
 
+      # The server logic is covered here rather than only on a device: both suites
+      # exercise the reverse-prompting pipeline against a real server process, with
+      # a stub model endpoint standing in for the paid API. They are offline-safe,
+      # so they cannot flake on a runner that cannot reach the image boards.
+      - name: Verify server reverse-prompting pipeline
+        run: |
+          set -eux
+          node --check server.js
+          node --check ai-reverse.js
+          sh android/tools/ci-server-tests.sh
+
       - name: Attach assets to the Android project
         run: |
           set -eux

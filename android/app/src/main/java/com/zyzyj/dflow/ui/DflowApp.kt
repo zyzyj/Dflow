@@ -8,9 +8,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Collections
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.Settings
@@ -46,6 +48,7 @@ private enum class Destination(
 ) {
     Browse("浏览", Icons.Filled.Explore, Icons.Outlined.Explore),
     Library("收藏", Icons.Filled.Collections, Icons.Outlined.Collections),
+    Ai("反推", Icons.Filled.AutoAwesome, Icons.Outlined.AutoAwesome),
     Settings("设置", Icons.Filled.Settings, Icons.Outlined.Settings),
 }
 
@@ -58,6 +61,8 @@ private data class ViewerRequest(
     val urls: List<String?>,
     val titles: List<String>,
     val index: Int,
+    val subtitles: List<String> = emptyList(),
+    val details: (Int) -> String = { "" },
     val posts: List<Post> = emptyList(),
     val favorites: List<Favorite> = emptyList(),
 )
@@ -68,6 +73,7 @@ fun DflowApp(viewModel: DflowViewModel) {
     val browse by viewModel.browse.collectAsStateWithLifecycle()
     val library by viewModel.library.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val ai by viewModel.ai.collectAsStateWithLifecycle()
 
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -159,8 +165,10 @@ fun DflowApp(viewModel: DflowViewModel) {
                         onOpenPost = { post ->
                             viewer = ViewerRequest(
                                 urls = browse.posts.map { viewModel.fullUrlFor(it) },
-                                titles = browse.posts.map { post.artist.ifBlank { "作品 ${it.id}" } },
+                                titles = browse.posts.map { it.artist.ifBlank { "作品 ${it.id}" } },
                                 index = browse.posts.indexOf(post).coerceAtLeast(0),
+                                subtitles = browse.posts.map { it.dimensionLabel },
+                                details = { index -> browse.posts.getOrNull(index)?.detailText.orEmpty() },
                                 posts = browse.posts,
                             )
                         },
@@ -175,6 +183,8 @@ fun DflowApp(viewModel: DflowViewModel) {
                     Destination.Library -> LibraryScreen(
                         state = library,
                         favoriteIds = savedIds,
+                        aiConfigured = ai.configured,
+                        batchRunning = ai.batch.running,
                         onFolderChange = viewModel::setFolder,
                         onOpen = { _, index ->
                             val visible = library.favorites.filter { it.folder == library.folder.key }
@@ -182,6 +192,8 @@ fun DflowApp(viewModel: DflowViewModel) {
                                 urls = visible.map { viewModel.fullImageUrlFor(it) },
                                 titles = visible.map { it.displayTitle },
                                 index = index.coerceAtLeast(0),
+                                subtitles = visible.map { it.folderLabel },
+                                details = { i -> visible.getOrNull(i)?.detailText.orEmpty() },
                                 favorites = visible,
                             )
                         },
@@ -192,6 +204,7 @@ fun DflowApp(viewModel: DflowViewModel) {
                         onEditPrompt = { promptTarget = it },
                         onEnqueue = viewModel::enqueueForReverse,
                         onDirectReverse = viewModel::directReverse,
+                        onLocalReverse = viewModel::aiReverse,
                         onRelease = { favorite ->
                             // The server refuses a release without a prompt AND a
                             // cached image; checking here turns a confusing
@@ -210,6 +223,18 @@ fun DflowApp(viewModel: DflowViewModel) {
                         onRetryCache = viewModel::retryCache,
                         onRefresh = viewModel::refreshLibrary,
                         imageUrl = { viewModel.imageUrlFor(it) },
+                    )
+
+                    Destination.Ai -> AiScreen(
+                        state = ai,
+                        pendingCount = pendingCount,
+                        onFieldChange = { baseUrl, apiKey, model, temperature, maxTokens, custom ->
+                            viewModel.updateAiFields(baseUrl, apiKey, model, temperature, maxTokens, custom)
+                        },
+                        onFetchModels = viewModel::fetchAiModels,
+                        onSave = viewModel::saveAiSettings,
+                        onReverseAll = viewModel::aiReverseAll,
+                        onStopBatch = viewModel::aiStopBatch,
                     )
 
                     Destination.Settings -> SettingsScreen(
@@ -250,6 +275,8 @@ fun DflowApp(viewModel: DflowViewModel) {
             urls = request.urls,
             titles = request.titles,
             initialIndex = request.index,
+            subtitles = request.subtitles,
+            details = request.details,
             isFavorite = { index ->
                 val post = request.posts.getOrNull(index)
                 val favorite = request.favorites.getOrNull(index)

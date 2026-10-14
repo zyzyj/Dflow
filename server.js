@@ -1,5 +1,13 @@
 import { createThumbnailCache, sendLocalImage } from './thumbnails.js';
 import { configureNetwork, applyProxy, activeProxy } from './network.js';
+import {
+  listModels as listAiModels,
+  reverseImage as reverseWithAi,
+  buildInstruction as buildAiInstruction,
+  cleanPrompt as cleanAiPrompt,
+  normalizeBaseUrl as normalizeAiBaseUrl,
+  isConfigured as isAiConfigured,
+} from './ai-reverse.js';
 import { danbooruCredentials, normalizePixivCookie, authFailure } from './auth.js';
 import { PixivBrowserLogin } from './browser-login.js';
 import express from "express";
@@ -424,7 +432,16 @@ const defaultSharedState = () => ({
     // Proxy for reaching Danbooru / Pixiv.  Empty means "no proxy".  Persisted
     // here so the setting survives restarts and is applied before the first
     // outbound request; see the applyProxy call right after readSharedState().
-    proxyUrl: ""
+    proxyUrl: "",
+    // Built-in vision model for reverse-prompting.  Stored here so the app can
+    // reverse a card without a companion agent running on another machine.
+    aiBaseUrl: "",
+    aiApiKey: "",
+    aiModel: "",
+    aiTemperature: 0.7,
+    aiMaxTokens: 2048,
+    // Appended to every built-in reverse request, on top of the presets.
+    aiCustomInstruction: ""
   },
   favorites: [],
   preferences: { mode: "latest", columns: 5, ratings: ["g", "s", "q", "e"], pixivRating: "safe", pixivDates: {}, search: "", selectedTags: [] },
@@ -488,10 +505,45 @@ function reverseQueueSnapshot() {
   const queue = renumberAllPendingQueue();
   return queue.items.map(({item}) => ({id:item.id, autoEnabled:item.autoEnabled, queueOrder:item.queueOrder}));
 }
+// In-flight built-in reverse jobs, keyed by card id, plus the partial text of
+// each so the UI can show progress during a long generation.
+const activeAiJobs = new Map();
+const aiProgress = new Map();
+const aiBatch = { running: false, total: 0, done: 0, failed: 0, currentId: '', error: '' };
+function aiJobActive(id) { return activeAiJobs.has(String(id)); }
+
+/**
+ * Looks up a preset's body text by name.
+ *
+ * The built-in reverse sends the same instructions the agent flow does, so the
+ * two paths produce comparable prompts. A missing preset yields an empty string
+ * rather than throwing: the request is still useful with only one of the two.
+ */
+function presetContentByName(type, name) {
+  if (!name) return '';
+  try {
+    // Use the same reader the presets API uses: it seeds and syncs the local
+    // library on first access, so the built-in presets are available even
+    // before the user has ever opened the preset editor.
+    const library = readPresets();
+    const list = Array.isArray(library?.[type]) ? library[type] : [];
+    return list.find(entry => entry?.name === name)?.content || '';
+  } catch {
+    return '';
+  }
+}
+
 function writeSharedState() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   sharedState.updatedAt = new Date().toISOString();
   fs.writeFileSync(STATE_FILE, JSON.stringify(sharedState, null, 2), "utf8");
+}
+// Numeric settings arrive as JSON values of unknown type; clamp them so a bad
+// value cannot be persisted and then break every later request.
+function normalizeAiNumber(value, fallback, min, max) {
+  const n = Number(value);
+  const base = Number.isFinite(n) ? n : (Number.isFinite(Number(fallback)) ? Number(fallback) : min);
+  return Math.min(max, Math.max(min, base));
 }
 function favoriteSourceOf(post) {
   const raw = String(post?.source || '').trim().toLowerCase();
@@ -917,7 +969,16 @@ app.put("/api/account", (req, res) => {
     tencentSecretKey: String(body.tencentSecretKey ?? sharedState.account.tencentSecretKey ?? "").trim(),
     volcAccessKey: String(body.volcAccessKey ?? sharedState.account.volcAccessKey ?? "").trim(),
     volcSecretKey: String(body.volcSecretKey ?? sharedState.account.volcSecretKey ?? "").trim(),
-    proxyUrl: String(body.proxyUrl ?? sharedState.account.proxyUrl ?? "").trim()
+    proxyUrl: String(body.proxyUrl ?? sharedState.account.proxyUrl ?? "").trim(),
+    aiBaseUrl: String(body.aiBaseUrl ?? sharedState.account.aiBaseUrl ?? "").trim(),
+    // The key is only overwritten when the client actually sends a value, so a
+    // settings screen that never receives the stored secret cannot wipe it by
+    // saving the other fields.
+    aiApiKey: body.aiApiKey !== undefined ? String(body.aiApiKey).trim() : (sharedState.account.aiApiKey || ""),
+    aiModel: String(body.aiModel ?? sharedState.account.aiModel ?? "").trim(),
+    aiTemperature: normalizeAiNumber(body.aiTemperature, sharedState.account.aiTemperature, 0, 2),
+    aiMaxTokens: normalizeAiNumber(body.aiMaxTokens, sharedState.account.aiMaxTokens, 256, 32000),
+    aiCustomInstruction: String(body.aiCustomInstruction ?? sharedState.account.aiCustomInstruction ?? "").slice(0, 4000)
   };
   writeSharedState();
   // A changed proxy takes effect immediately, without a service restart.
@@ -1879,6 +1940,225 @@ app.get('/api/network/test', async (req, res) => {
   res.json({ ok: results.some(item => item.ok), proxy: activeProxy, explicit: Boolean(sharedState.account.proxyUrl), results, ms: Date.now() - started });
 });
 app.post('/api/auth-test',testDanbooruAuth);
+
+// ---- built-in vision reverse prompting -------------------------------------
+//
+// This is the on-device path: DFlow calls a vision model itself instead of
+// waiting for an external MCP agent. The MCP route still exists and the two are
+// independent — a card can be reversed by whichever is available.
+
+/** Lists the models the configured endpoint offers. */
+app.post('/api/ai/models', async (req, res) => {
+  const body = req.body || {};
+  // Fall back to stored values so the button works from a settings screen that
+  // does not re-send the key it never received.
+  const baseUrl = String(body.aiBaseUrl ?? sharedState.account.aiBaseUrl ?? '').trim();
+  const apiKey = body.aiApiKey ? String(body.aiApiKey).trim() : (sharedState.account.aiApiKey || '');
+  try {
+    const models = await listAiModels({ baseUrl, apiKey });
+    res.json({ ok: true, models, baseUrl: normalizeAiBaseUrl(baseUrl) });
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message });
+  }
+});
+
+/**
+ * Reverses one card with the built-in model and writes the prompt back.
+ *
+ * Writing the prompt back through the same path the agent flow uses means the
+ * card ends up in the worded folder with correct timestamps and the reverse
+ * status is recorded, so the two paths are indistinguishable downstream.
+ */
+app.post('/api/ai/reverse/:id', async (req, res) => {
+  const item = favoriteById(req.params.id);
+  if (!item) return res.status(404).json({ error: '收藏不存在' });
+  if (item.folder !== 'pending') return res.status(409).json({ error: '只有待反推区的卡片可以反推' });
+
+  const imagePath = hasUsableCache(item) ? cachedImagePath(item) : null;
+  if (!imagePath) return res.status(409).json({ error: '原图还没缓存完成，请稍后再试' });
+
+  if (!isAiConfigured(sharedState.account)) {
+    return res.status(409).json({ error: '还没配置内置 AI 模型，请到「AI 反推」页填写' });
+  }
+
+  if (aiJobActive(item.id)) {
+    return res.status(409).json({ error: '这张正在反推中' });
+  }
+
+  item.reverseStatus = 'processing';
+  item.reverseError = '';
+  item.reverseStartedAt = new Date().toISOString();
+  writeSharedState();
+
+  const controller = new AbortController();
+  activeAiJobs.set(String(item.id), controller);
+
+  try {
+    const instruction = buildAiInstruction({
+      reversePreset: presetContentByName('reverse', chosenReverse(item.reversePreset)),
+      expansionPreset: presetContentByName('expansion', chosenExpansion(item.preset)),
+      customInstruction: [item.customInstruction, sharedState.account.aiCustomInstruction]
+        .filter(Boolean).join('\n'),
+    });
+
+    const raw = await reverseWithAi({
+      baseUrl: sharedState.account.aiBaseUrl,
+      apiKey: sharedState.account.aiApiKey,
+      model: sharedState.account.aiModel,
+      temperature: sharedState.account.aiTemperature,
+      maxTokens: sharedState.account.aiMaxTokens,
+      imagePath,
+      instruction,
+      signal: controller.signal,
+      onDelta: text => {
+        // Publish progress so a long generation is visibly moving.
+        aiProgress.set(String(item.id), text);
+      },
+    });
+
+    const prompt = cleanAiPrompt(raw);
+    if (!prompt) throw new Error('模型返回了空提示词');
+
+    // Same bookkeeping the agent path performs on success.
+    const now = new Date().toISOString();
+    item.prompt = prompt;
+    item.promptWrittenAt = now;
+    item.wordedAt = now;
+    item.reverseStatus = 'success';
+    item.reverseError = '';
+    item.resolvedPreset = chosenExpansion(item.preset);
+    if (item.folder === 'pending') {
+      if (moveCache(item, 'worded')) item.folder = 'worded';
+      item.autoEnabled = false;
+      item.queueOrder = 0;
+    }
+    renumberAllPendingQueue();
+    writeSharedState();
+    res.json({ ok: true, favorite: item, prompt });
+  } catch (error) {
+    const aborted = error.name === 'AbortError';
+    item.reverseStatus = 'failed';
+    item.reverseError = (aborted ? '已取消' : (error.message || '反推失败')).slice(0, 1000);
+    writeSharedState();
+    res.status(aborted ? 499 : 502).json({ ok: false, error: item.reverseError });
+  } finally {
+    activeAiJobs.delete(String(item.id));
+    aiProgress.delete(String(item.id));
+  }
+});
+
+/** Live progress for a running built-in reverse, polled by the client. */
+app.get('/api/ai/progress/:id', (req, res) => {
+  res.json({
+    running: aiJobActive(req.params.id),
+    text: aiProgress.get(String(req.params.id)) || '',
+  });
+});
+
+/** Cancels a running built-in reverse. */
+app.post('/api/ai/cancel/:id', (req, res) => {
+  const controller = activeAiJobs.get(String(req.params.id));
+  if (!controller) return res.status(404).json({ error: '没有正在进行的反推' });
+  controller.abort();
+  res.json({ ok: true });
+});
+
+/**
+ * Reverses every eligible card in the pending queue, one at a time.
+ *
+ * Serial on purpose: vision endpoints rate-limit aggressively, and running
+ * several at once mostly produces 429s and partial failures. Progress is
+ * reported per card so the UI can show which one is being worked on.
+ */
+app.post('/api/ai/reverse-batch', async (req, res) => {
+  if (aiBatch.running) return res.status(409).json({ error: '批量反推已在进行中' });
+  if (!isAiConfigured(sharedState.account)) {
+    return res.status(409).json({ error: '还没配置内置 AI 模型，请到「AI 反推」页填写' });
+  }
+
+  const queue = renumberAllPendingQueue();
+  const targets = queue.items
+    .map(entry => entry.item)
+    .filter(item => item.autoEnabled !== false && hasUsableCache(item) && !item.prompt);
+
+  if (!targets.length) {
+    return res.status(409).json({ error: '队列里没有可反推的卡片（可能还在下载原图）' });
+  }
+
+  aiBatch.running = true;
+  aiBatch.total = targets.length;
+  aiBatch.done = 0;
+  aiBatch.failed = 0;
+  aiBatch.currentId = '';
+  aiBatch.error = '';
+
+  // Answer immediately; the client polls /api/ai/batch or the queue for progress.
+  res.status(202).json({ ok: true, total: targets.length });
+
+  void (async () => {
+    for (const item of targets) {
+      if (!aiBatch.running) break;
+      aiBatch.currentId = String(item.id);
+      const controller = new AbortController();
+      activeAiJobs.set(String(item.id), controller);
+      try {
+        const instruction = buildAiInstruction({
+          reversePreset: presetContentByName('reverse', chosenReverse(item.reversePreset)),
+          expansionPreset: presetContentByName('expansion', chosenExpansion(item.preset)),
+          customInstruction: [item.customInstruction, sharedState.account.aiCustomInstruction]
+            .filter(Boolean).join('\n'),
+        });
+        const raw = await reverseWithAi({
+          baseUrl: sharedState.account.aiBaseUrl,
+          apiKey: sharedState.account.aiApiKey,
+          model: sharedState.account.aiModel,
+          temperature: sharedState.account.aiTemperature,
+          maxTokens: sharedState.account.aiMaxTokens,
+          imagePath: cachedImagePath(item),
+          instruction,
+          signal: controller.signal,
+          onDelta: text => aiProgress.set(String(item.id), text),
+        });
+        const prompt = cleanAiPrompt(raw);
+        if (!prompt) throw new Error('模型返回了空提示词');
+        const now = new Date().toISOString();
+        item.prompt = prompt;
+        item.promptWrittenAt = now;
+        item.wordedAt = now;
+        item.reverseStatus = 'success';
+        item.reverseError = '';
+        item.resolvedPreset = chosenExpansion(item.preset);
+        if (item.folder === 'pending') {
+          if (moveCache(item, 'worded')) item.folder = 'worded';
+          item.autoEnabled = false;
+          item.queueOrder = 0;
+        }
+        aiBatch.done += 1;
+      } catch (error) {
+        item.reverseStatus = 'failed';
+        item.reverseError = (error.message || '反推失败').slice(0, 1000);
+        aiBatch.failed += 1;
+        // Keep going: one bad image must not strand the rest of the queue.
+      } finally {
+        activeAiJobs.delete(String(item.id));
+        aiProgress.delete(String(item.id));
+      }
+      renumberAllPendingQueue();
+      writeSharedState();
+    }
+    aiBatch.running = false;
+    aiBatch.currentId = '';
+    writeSharedState();
+  })();
+});
+
+app.get('/api/ai/batch', (_req, res) => res.json(aiBatch));
+
+app.post('/api/ai/batch/stop', (_req, res) => {
+  aiBatch.running = false;
+  for (const controller of activeAiJobs.values()) controller.abort();
+  res.json({ ok: true });
+});
 app.get("/api/posts", async (req, res) => {
   const upstream = new URL("/posts.json", DANBOORU);
   for (const key of ["tags", "limit", "page"]) if (typeof req.query[key] === "string") upstream.searchParams.set(key, req.query[key]);

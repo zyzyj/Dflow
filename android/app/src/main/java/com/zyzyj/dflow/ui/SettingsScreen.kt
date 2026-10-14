@@ -241,15 +241,11 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         InfoCard(
-            "反推提示词由外部 AI Agent 完成（Agent 读取原图后写回），App 自身不识别图片。" +
-                "需要在电脑上连接本机 MCP 才能自动反推；也可以手动填写提示词。\n\n" +
-                "所有收藏、缓存与设置都保存在应用私有目录，卸载会一并删除。"
-        )
-        Text(
-            text = "版本号与构建",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 4.dp),
+            "反推提示词有两种方式：\n" +
+                "• 内置 AI——在「反推」页配好视觉模型，手机上就能自动反推；\n" +
+                "• 外部 Agent——在电脑上连接本机 MCP，由 Agent 读取图片并写回。\n" +
+                "也可以直接手动填写提示词。\n\n" +
+                "收藏、缓存与设置都保存在应用私有目录，卸载会一并删除。"
         )
     }
 }

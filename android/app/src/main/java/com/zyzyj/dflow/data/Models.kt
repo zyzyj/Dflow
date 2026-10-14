@@ -51,6 +51,30 @@ data class Post(
 
     val artist: String
         get() = tag_string_artist.split(' ').firstOrNull()?.replace('_', ' ') ?: ""
+
+    /** Compact size line for the viewer's subtitle. */
+    val dimensionLabel: String
+        get() = if (image_width > 0 && image_height > 0) "${image_width}×${image_height}" else ""
+
+    /**
+     * Metadata shown in the viewer's bottom panel.
+     *
+     * Only non-empty lines are emitted, so the panel never shows a label with
+     * nothing after it.
+     */
+    val detailText: String
+        get() = buildList {
+            if (id > 0) add("ID  $id")
+            if (dimensionLabel.isNotBlank()) add("尺寸  $dimensionLabel")
+            if (rating.isNotBlank()) add("分级  ${rating.uppercase()}")
+            if (score > 0) add("评分  $score")
+            if (fav_count > 0) add("收藏数  $fav_count")
+            if (created_at.isNotBlank()) add("发布  ${created_at.take(10)}")
+            if (tag_string_artist.isNotBlank()) add("画师  ${tag_string_artist.replace('_', ' ')}")
+            if (tag_string_copyright.isNotBlank()) add("版权  ${tag_string_copyright.replace('_', ' ')}")
+            if (tag_string_character.isNotBlank()) add("角色  ${tag_string_character.replace('_', ' ')}")
+            if (tag_string_general.isNotBlank()) add("\n标签\n${tag_string_general.replace('_', ' ')}")
+        }.joinToString("\n")
 }
 
 /**
@@ -110,6 +134,38 @@ data class Favorite(
 
     val hasPrompt: Boolean
         get() = prompt.isNotBlank()
+
+    /** Folder name in Chinese, for the viewer subtitle. */
+    val folderLabel: String
+        get() = when (folder) {
+            "original" -> "原始收藏"
+            "pending" -> "待反推"
+            "worded" -> "有词区"
+            "completed" -> "已完成"
+            else -> folder
+        }
+
+    /**
+     * Metadata panel content for the viewer. Prompts are included in full — the
+     * panel is the only place they can be read and selected without leaving the
+     * image.
+     */
+    val detailText: String
+        get() = buildList {
+            if (image_width > 0 && image_height > 0) add("尺寸  ${image_width}×${image_height}")
+            if (author.isNotBlank()) add("作者  $author")
+            if (rating.isNotBlank()) add("分级  ${rating.uppercase()}")
+            add("位置  $folderLabel")
+            if (preset.isNotBlank()) add("扩写预设  $preset")
+            if (reversePreset.isNotBlank()) add("反推预设  $reversePreset")
+            if (cacheFile.isNotBlank()) add("缓存  $cacheFile")
+            if (cacheError.isNotBlank()) add("缓存错误  $cacheError")
+            if (reverseStatus.isNotBlank()) add("反推状态  $reverseStatus")
+            if (reverseError.isNotBlank()) add("反推错误  $reverseError")
+            if (tag_string_general.isNotBlank()) add("标签  ${tag_string_general.replace('_', ' ')}")
+            if (prompt.isNotBlank()) add("\n提示词\n$prompt")
+            if (summary.isNotBlank()) add("\n说明\n$summary")
+        }.joinToString("\n")
 }
 
 @Serializable
@@ -160,7 +216,16 @@ data class Account(
     val volcSecretKey: String = "",
     val googleTranslateKey: String = "",
     val proxyUrl: String = "",
-)
+    // Built-in vision model used for reverse-prompting without an external agent.
+    val aiBaseUrl: String = "",
+    val aiApiKey: String = "",
+    val aiModel: String = "",
+    val aiTemperature: Double = 0.7,
+    val aiMaxTokens: Int = 2048,
+    val aiCustomInstruction: String = "",
+) {
+    val aiConfigured: Boolean get() = aiBaseUrl.isNotBlank() && aiModel.isNotBlank()
+}
 
 @Serializable
 data class Preferences(
@@ -208,6 +273,34 @@ data class McpSession(
     val since: Long = 0,
     val seenAt: Long = 0,
 )
+
+// ---- built-in vision reverse ------------------------------------------------
+
+@Serializable
+data class AiModelList(val ok: Boolean = false, val models: List<String> = emptyList(), val baseUrl: String = "", val error: String = "")
+
+@Serializable
+data class AiReverseResult(val ok: Boolean = false, val favorite: Favorite? = null, val prompt: String = "", val error: String = "")
+
+@Serializable
+data class AiProgress(val running: Boolean = false, val text: String = "")
+
+@Serializable
+data class AiBatchStart(val ok: Boolean = false, val total: Int = 0, val error: String = "")
+
+/** Live counters for a running batch reverse. */
+@Serializable
+data class AiBatch(
+    val running: Boolean = false,
+    val total: Int = 0,
+    val done: Int = 0,
+    val failed: Int = 0,
+    val currentId: String = "",
+    val error: String = "",
+) {
+    val finished: Boolean get() = !running
+    val processed: Int get() = done + failed
+}
 
 @Serializable
 data class NetworkProbe(

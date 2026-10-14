@@ -7,9 +7,9 @@
 验证「收藏 -> 待反推 -> 队列 -> 写提示词 -> 归档」这条服务端状态机的行为，
 这正是原生 UI 要调用的全部接口。
 """
-import json, urllib.request, time
+import json, os, urllib.request, time
 
-BASE = 'http://127.0.0.1:4173'
+BASE = f"http://127.0.0.1:{os.environ.get('DFLOW_E2E_PORT', '4173')}"
 
 
 def req(method, path, body=None):
