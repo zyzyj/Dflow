@@ -77,7 +77,7 @@ class DflowApi(private val port: Int) {
             execute(
                 Request.Builder()
                     .url(url(path))
-                    .put(jsonBody.toRequestBody("application/json".toMediaType()))
+                    .put(jsonBody.toRequestBody(JSON_MEDIA))
                     .build()
             )
         } catch (e: ApiException) {
@@ -85,6 +85,54 @@ class DflowApi(private val port: Int) {
         } catch (e: IOException) {
             throw ApiException("无法连接本地服务，请确认服务正在运行", e.message.orEmpty())
         }
+    }
+
+    private suspend fun patchRaw(path: String, jsonBody: String): String = withContext(Dispatchers.IO) {
+        try {
+            execute(
+                Request.Builder()
+                    .url(url(path))
+                    .patch(jsonBody.toRequestBody(JSON_MEDIA))
+                    .build()
+            )
+        } catch (e: ApiException) {
+            throw e
+        } catch (e: IOException) {
+            throw ApiException("无法连接本地服务，请确认服务正在运行", e.message.orEmpty())
+        }
+    }
+
+    private suspend fun postRaw(path: String, jsonBody: String): String = withContext(Dispatchers.IO) {
+        try {
+            execute(
+                Request.Builder()
+                    .url(url(path))
+                    .post(jsonBody.toRequestBody(JSON_MEDIA))
+                    .build()
+            )
+        } catch (e: ApiException) {
+            throw e
+        } catch (e: IOException) {
+            throw ApiException("无法连接本地服务，请确认服务正在运行", e.message.orEmpty())
+        }
+    }
+
+    /** Minimal JSON string escaping for hand-built request bodies. */
+    private fun quote(value: String): String {
+        val sb = StringBuilder(value.length + 2)
+        sb.append('"')
+        for (ch in value) {
+            when (ch) {
+                '"' -> sb.append("\\\"")
+                '\\' -> sb.append("\\\\")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                else -> if (ch < ' ') sb.append("\\u%04x".format(ch.code)) else sb.append(ch)
+            }
+        }
+        sb.append('"')
+        return sb.toString()
     }
 
     private suspend inline fun <reified T> get(path: String): T =
@@ -131,13 +179,73 @@ class DflowApi(private val port: Int) {
 
     suspend fun metadataImages(): List<Favorite> = get("/api/metadata/images")
 
+    /**
+     * Saves the whole favourites list.
+     *
+     * The server treats this as authoritative and reconciles against its own
+     * copy: fields it owns (folder, prompt, reverseStatus, cache metadata) are
+     * preserved from the existing record, so a stale client cannot clobber a
+     * worker's result. Send only identity plus display fields for new cards.
+     */
     suspend fun saveFavorites(favorites: List<Favorite>): String =
         putRaw("/api/favorites", json.encodeToString(FavoritesPayload.serializer(), FavoritesPayload(favorites)))
 
-    suspend fun updateAccount(account: Account): String =
-        putRaw("/api/account", json.encodeToString(Account.serializer(), account))
+    /**
+     * Applies a partial update to one card. This is how a card moves between
+     * folders and how a prompt gets written:
+     *  - folder=pending   → enqueue for reverse-prompting
+     *  - prompt="..."     → store the prompt and move to the worded folder
+     *  - folder=completed → release to the archive (the server refuses without a
+     *                       prompt and a downloaded image)
+     *
+     * [id] must be the card's raw id. For site cards the server requires a plain
+     * numeric id and silently drops anything else while saving, so "post_123"
+     * would vanish from the list instead of being reported as an error.
+     */
+    suspend fun patchFavorite(
+        id: String,
+        folder: String? = null,
+        prompt: String? = null,
+        preset: String? = null,
+        reversePreset: String? = null,
+        autoEnabled: Boolean? = null,
+        customInstruction: String? = null,
+        retryCache: Boolean? = null,
+        retryReverse: Boolean? = null,
+    ): Favorite {
+        val fields = mutableListOf<String>()
+        folder?.let { fields += "\"folder\":${quote(it)}" }
+        prompt?.let { fields += "\"prompt\":${quote(it)}" }
+        preset?.let { fields += "\"preset\":${quote(it)}" }
+        reversePreset?.let { fields += "\"reversePreset\":${quote(it)}" }
+        autoEnabled?.let { fields += "\"autoEnabled\":$it" }
+        customInstruction?.let { fields += "\"customInstruction\":${quote(it)}" }
+        retryCache?.let { fields += "\"retryCache\":$it" }
+        retryReverse?.let { fields += "\"retryReverse\":$it" }
+        val body = patchRaw("/api/favorites/${encode(id)}", "{${fields.joinToString(",")}}")
+        return json.decodeFromString<FavoriteDetail>(body).favorite
+    }
+
+    /** Asks the server to queue this card for an online agent to reverse-prompt. */
+    suspend fun directReverse(id: String): ReverseDirectResult {
+        val body = postRaw("/api/reverse/${encode(id)}/direct", "{}")
+        return json.decodeFromString(body)
+    }
 
     suspend fun presets(): PresetLibrary = get("/api/mcp/presets")
+
+    /**
+     * Connected MCP agents.
+     *
+     * Reverse-prompting is performed by an external agent that reads the image
+     * and writes the prompt back; the server only queues and stores. This tells
+     * the UI whether handing a card off can work at all, so the button can be
+     * disabled with a reason instead of failing on tap.
+     */
+    suspend fun mcpSessions(): List<McpSession> = get("/api/mcp/sessions")
+
+    suspend fun updateAccount(account: Account): String =
+        putRaw("/api/account", json.encodeToString(Account.serializer(), account))
 
     // ---- settings / diagnostics -------------------------------------------
 
@@ -169,6 +277,10 @@ class DflowApi(private val port: Int) {
 
     private fun encode(value: String): String =
         URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
+    private companion object {
+        val JSON_MEDIA = "application/json".toMediaType()
+    }
 }
 
 @kotlinx.serialization.Serializable

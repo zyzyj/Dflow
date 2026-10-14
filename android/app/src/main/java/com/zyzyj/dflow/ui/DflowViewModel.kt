@@ -6,6 +6,7 @@ import com.zyzyj.dflow.data.Account
 import com.zyzyj.dflow.data.AppState
 import com.zyzyj.dflow.data.DflowApi
 import com.zyzyj.dflow.data.Favorite
+import com.zyzyj.dflow.data.McpSession
 import com.zyzyj.dflow.data.NetworkTest
 import com.zyzyj.dflow.data.Post
 import com.zyzyj.dflow.data.PresetLibrary
@@ -59,6 +60,9 @@ data class LibraryUiState(
     val error: String? = null,
     val errorDetail: String = "",
     val folder: LibraryFolder = LibraryFolder.Original,
+    /** Connected agents. Reverse-prompting needs one; empty means the handoff
+     *  button cannot succeed, and the UI says so instead of failing on tap. */
+    val agents: List<McpSession> = emptyList(),
 )
 
 data class SettingsUiState(
@@ -199,7 +203,8 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
                 // keeps current; /api/local-gallery adds the handwritten worded
                 // entries. Favourites come from state so the count is never stale.
                 val state = api.state()
-                _library.update { it.copy(favorites = state.favorites, loading = false) }
+                val agents = runCatching { api.mcpSessions() }.getOrDefault(emptyList())
+                _library.update { it.copy(favorites = state.favorites, loading = false, agents = agents) }
                 _settings.update { it.copy(state = state) }
             } catch (e: DflowApi.ApiException) {
                 _library.update {
@@ -246,7 +251,111 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
 
     /** The saved counterpart of a browsed post, if the user already saved it. */
     fun findFavorite(favorites: List<Favorite>, post: Post): Favorite? =
-        favorites.firstOrNull { it.sourceId == post.id.toString() || it.id == "post_${post.id}" }
+        favorites.firstOrNull {
+            it.sourceId == post.id.toString() || it.id == post.id.toString()
+        }
+
+    // ---- reverse-prompt workflow -------------------------------------------
+
+    /**
+     * Moves a card into the pending queue, which is what makes it eligible for
+     * reverse-prompting. The server assigns the queue position and starts
+     * downloading the full-size image; the agent cannot read the image until
+     * that download finishes, so the UI has to show cache progress rather than
+     * let the user fire off a direct request immediately.
+     */
+    fun enqueueForReverse(favorite: Favorite) {
+        runPatch(favorite.id, folder = "pending", successMessage = "已加入待反推队列")
+    }
+
+    /** Writes a prompt to a card. The server moves it to the worded folder. */
+    fun writePrompt(favorite: Favorite, prompt: String) {
+        if (prompt.isBlank()) return
+        runPatch(favorite.id, prompt = prompt, successMessage = "提示词已保存")
+    }
+
+    /** Releases a finished card to the archive. The server validates readiness. */
+    fun releaseToCompleted(favorite: Favorite) {
+        runPatch(favorite.id, folder = "completed", successMessage = "已归档")
+    }
+
+    /** Puts a card back into the original folder. */
+    fun moveToOriginal(favorite: Favorite) {
+        runPatch(favorite.id, folder = "original", successMessage = "已移回原始收藏")
+    }
+
+    /** Retries a failed image download. */
+    fun retryCache(favorite: Favorite) {
+        runPatch(favorite.id, retryCache = true, successMessage = "已重新开始下载")
+    }
+
+    /** Retries a failed reverse-prompt job, re-queuing it. */
+    fun retryReverse(favorite: Favorite) {
+        runPatch(favorite.id, retryReverse = true, successMessage = "已重新加入队列")
+    }
+
+    /**
+     * Hands a card to a connected agent for reverse-prompting.
+     *
+     * This needs an MCP agent to be online — the app itself does not look at
+     * images. When nothing is connected the server answers 409 and that message
+     * is surfaced verbatim, because "no agent connected" is the actionable part.
+     */
+    fun directReverse(favorite: Favorite) {
+        // Fail fast with a reason rather than letting the server answer 409 after
+        // a round trip: the missing agent is the whole story.
+        if (_library.value.agents.isEmpty()) {
+            _settings.update {
+                it.copy(
+                    message = "没有在线的 AI Agent。反推需要外部 Agent 读取图片并写回提示词，请先在电脑上连接本机 MCP。",
+                    messageIsError = true,
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val result = api.directReverse(favorite.id)
+                val agent = result.request?.agentName.orEmpty()
+                _settings.update {
+                    it.copy(
+                        message = if (agent.isNotBlank()) "已提交给 $agent" else "已提交给在线 Agent",
+                        messageIsError = false,
+                    )
+                }
+                refreshLibrary()
+            } catch (e: DflowApi.ApiException) {
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
+
+    private fun runPatch(
+        id: String,
+        folder: String? = null,
+        prompt: String? = null,
+        retryCache: Boolean? = null,
+        retryReverse: Boolean? = null,
+        successMessage: String,
+    ) {
+        viewModelScope.launch {
+            try {
+                api.patchFavorite(
+                    id = id,
+                    folder = folder,
+                    prompt = prompt,
+                    retryCache = retryCache,
+                    retryReverse = retryReverse,
+                )
+                _settings.update { it.copy(message = successMessage, messageIsError = false) }
+                refreshLibrary()
+            } catch (e: DflowApi.ApiException) {
+                // The server's refusals are specific and worth showing as-is
+                // ("prompt and cached image required", "image not cached yet").
+                _settings.update { it.copy(message = e.message, messageIsError = true) }
+            }
+        }
+    }
 
     // ---- settings ----------------------------------------------------------
 
@@ -305,20 +414,34 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
         _settings.update { it.copy(message = null) }
     }
 
-    /** Resolves the thumbnail URL for a library card (local cards live on the server). */
-    fun imageUrlFor(favorite: Favorite, thumbnail: Boolean = true): String? =
-        if (favorite.isRemote) api.proxyImage(favorite.preview_file_url.ifBlank {
-            favorite.large_file_url.ifBlank { favorite.file_url }
-        })
-        else if (favorite.cacheFile.isNotBlank()) api.localImage(favorite.id, thumbnail)
-        else null
+    /**
+     * Thumbnail URL for a library card.
+     *
+     * A card can have both a remote address and a local cache; prefer the cache
+     * (it is the file the user actually saved, and works offline), then fall
+     * back to the remote address through the proxy. A card with neither is a
+     * prompt-only record and gets a placeholder in the UI.
+     */
+    fun imageUrlFor(favorite: Favorite, thumbnail: Boolean = true): String? {
+        if (favorite.cacheFile.isNotBlank() && favorite.cacheStatus == "ready") {
+            return api.localImage(favorite.id, thumbnail)
+        }
+        val remote = favorite.preview_file_url.ifBlank {
+            favorite.large_file_url.ifBlank { favorite.file_url.ifBlank { favorite.sourceImageUrl } }
+        }
+        return api.proxyImage(remote)
+    }
 
-    fun fullImageUrlFor(favorite: Favorite): String? =
-        if (favorite.isRemote) api.proxyImage(favorite.file_url.ifBlank {
-            favorite.large_file_url
-        })
-        else if (favorite.cacheFile.isNotBlank()) api.localImage(favorite.id, thumbnail = false)
-        else null
+    /** Full-size URL for the viewer. Prefers the original over the thumbnail. */
+    fun fullImageUrlFor(favorite: Favorite): String? {
+        if (favorite.cacheFile.isNotBlank() && favorite.cacheStatus == "ready") {
+            return api.localImage(favorite.id, thumbnail = false)
+        }
+        val remote = favorite.file_url.ifBlank {
+            favorite.large_file_url.ifBlank { favorite.sourceImageUrl }
+        }
+        return api.proxyImage(remote)
+    }
 
     fun gridUrlFor(post: Post): String? = api.proxyImage(post.gridUrl)
 
@@ -327,7 +450,10 @@ class DflowViewModel(private val api: DflowApi) : ViewModel() {
 
 /** Converts a browsed post into the shape the server stores for favourites. */
 private fun Post.toFavorite(): Favorite = Favorite(
-    id = "post_$id",
+    // The server keeps a plain numeric id for site cards: cleanFavorite() drops
+    // any entry whose id is not all digits, and it silently disappears from the
+    // saved list rather than reporting an error.
+    id = id.toString(),
     source = if (pixivId != null) "pixiv" else "danbooru",
     sourceId = id.toString(),
     sourceImageUrl = file_url ?: large_file_url ?: preview_file_url.orEmpty(),

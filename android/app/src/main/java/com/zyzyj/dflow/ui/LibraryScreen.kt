@@ -14,12 +14,16 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid
 import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
 import androidx.compose.foundation.lazy.staggeredgrid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -33,38 +37,86 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.zyzyj.dflow.data.Favorite
+import com.zyzyj.dflow.data.McpSession
 
 /**
- * The local library: saved cards grouped by workflow stage.
+ * The local library with its reverse-prompt workflow.
  *
- * The four folders are the server's own model (original → pending → worded →
- * completed), so the tab order mirrors the pipeline rather than being arbitrary.
+ * Each card shows the actions that are valid *for its current folder*, because
+ * the server enforces a pipeline: a card must be queued (pending) and have its
+ * full-size image cached before an agent can read it, and it needs a prompt
+ * before it can be archived. Offering every button everywhere would just produce
+ * refusals.
  */
 @Composable
 fun LibraryScreen(
     state: LibraryUiState,
+    favoriteIds: Set<String>,
     onFolderChange: (LibraryFolder) -> Unit,
     onOpen: (Favorite, Int) -> Unit,
     onCopyPrompt: (Favorite) -> Unit,
+    onEditPrompt: (Favorite) -> Unit,
+    onEnqueue: (Favorite) -> Unit,
+    onDirectReverse: (Favorite) -> Unit,
+    onRelease: (Favorite) -> Unit,
+    onRestore: (Favorite) -> Unit,
+    onRetryCache: (Favorite) -> Unit,
     onRefresh: () -> Unit,
     imageUrl: (Favorite) -> String?,
     modifier: Modifier = Modifier,
 ) {
-    val visible = state.favorites.filter { it.folder == state.folder.key }
-    // Tab counts come from the full list so an empty folder still shows its size.
+    val visible = state.favorites
+        .filter { it.folder == state.folder.key }
+        .sortedWith(comparatorFor(state.folder))
     val counts = LibraryFolder.entries.associateWith { folder ->
         state.favorites.count { it.folder == folder.key }
     }
 
     Column(modifier.fillMaxSize()) {
-        ScrollableTabRow(selectedTabIndex = LibraryFolder.entries.indexOf(state.folder)) {
+        // Reverse-prompting is done by an external agent, not by the phone. When
+        // none is connected the whole pipeline stalls, so say so up front rather
+        // than let each button fail individually.
+        if (state.agents.isEmpty()) {
+            Surface(
+                color = MaterialTheme.colorScheme.tertiaryContainer,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text(
+                    text = "没有在线的 AI Agent。「直推」需要外部 Agent 读取原图并写回提示词；" +
+                        "你仍可手动编辑提示词，或在电脑上连接本机 MCP 后自动反推。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.padding(10.dp),
+                )
+            }
+        } else {
+            Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text(
+                    text = "已连接：" + state.agents.joinToString("、") { agent ->
+                        agent.name.ifBlank { "Agent" }
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.padding(10.dp),
+                )
+            }
+        }
+
+        ScrollableTabRow(
+            selectedTabIndex = LibraryFolder.entries.indexOf(state.folder),
+            edgePadding = 8.dp,
+        ) {
             LibraryFolder.entries.forEach { folder ->
                 Tab(
                     selected = folder == state.folder,
@@ -83,14 +135,10 @@ fun LibraryScreen(
                     ErrorState(state.error, state.errorDetail, onRetry = onRefresh)
                 }
                 visible.isEmpty() -> {
-                    EmptyHint(
-                        text = "${state.folder.label}还是空的",
-                        hint = hintFor(state.folder),
-                        onRetry = onRefresh,
-                    )
+                    EmptyHint(text = "${state.folder.label}还是空的", hint = hintFor(state.folder))
                 }
                 else -> LazyVerticalStaggeredGrid(
-                    columns = StaggeredGridCells.Adaptive(minSize = 150.dp),
+                    columns = StaggeredGridCells.Adaptive(minSize = 160.dp),
                     contentPadding = PaddingValues(10.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalItemSpacing = 8.dp,
@@ -102,6 +150,12 @@ fun LibraryScreen(
                             imageUrl = imageUrl(favorite),
                             onOpen = { onOpen(favorite, visible.indexOf(favorite)) },
                             onCopyPrompt = { onCopyPrompt(favorite) },
+                            onEditPrompt = { onEditPrompt(favorite) },
+                            onEnqueue = { onEnqueue(favorite) },
+                            onDirectReverse = { onDirectReverse(favorite) },
+                            onRelease = { onRelease(favorite) },
+                            onRestore = { onRestore(favorite) },
+                            onRetryCache = { onRetryCache(favorite) },
                         )
                     }
                 }
@@ -110,11 +164,21 @@ fun LibraryScreen(
     }
 }
 
+/** Pending work first, then newest; completed items read best by completion time. */
+private fun comparatorFor(folder: LibraryFolder): Comparator<Favorite> = when (folder) {
+    LibraryFolder.Pending -> compareBy(
+        { if (it.autoEnabled) 0 else 1 },
+        { it.queueOrder },
+    )
+    LibraryFolder.Completed -> compareByDescending { it.completedAt.ifBlank { it.updatedAt } }
+    else -> compareByDescending { it.promptWrittenAt.ifBlank { it.createdAt } }
+}
+
 private fun hintFor(folder: LibraryFolder): String = when (folder) {
-    LibraryFolder.Original -> "在浏览页点卡片上的心形即可收藏"
-    LibraryFolder.Pending -> "在收藏卡片上点「AI」会把原图加入待反推队列"
-    LibraryFolder.Worded -> "反推完成的提示词会出现在这里，可一键复制"
-    LibraryFolder.Completed -> "提示词就绪后点「→」释放归档到这里"
+    LibraryFolder.Original -> "在浏览页点心形即可收藏；点卡片上的「AI」加入待反推"
+    LibraryFolder.Pending -> "图集下载完成后，点「直推」把它交给在线的 AI Agent"
+    LibraryFolder.Worded -> "点提示词区可查看/编辑；点「→」归档"
+    LibraryFolder.Completed -> "已归档的提示词可一键复制"
 }
 
 @Composable
@@ -123,86 +187,149 @@ private fun FavoriteCard(
     imageUrl: String?,
     onOpen: () -> Unit,
     onCopyPrompt: () -> Unit,
+    onEditPrompt: () -> Unit,
+    onEnqueue: () -> Unit,
+    onDirectReverse: () -> Unit,
+    onRelease: () -> Unit,
+    onRestore: () -> Unit,
+    onRetryCache: () -> Unit,
 ) {
     Surface(
         shape = RoundedCornerShape(14.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
+        modifier = Modifier.fillMaxWidth(),
     ) {
-        Box {
-            if (imageUrl != null) {
-                AsyncImage(
-                    model = imageUrl,
-                    contentDescription = favorite.displayTitle,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(favorite.aspectRatio.coerceIn(0.4f, 2.2f))
-                        .clip(RoundedCornerShape(14.dp)),
-                )
-            } else {
-                // A card with no cached image is still a valid record (a prompt
-                // written by hand); show a placeholder rather than collapsing it.
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(1f)
-                        .background(MaterialTheme.colorScheme.surfaceVariant),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        Icons.Outlined.Image,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        Column {
+            Box(Modifier.clickable(onClick = onOpen)) {
+                if (imageUrl != null) {
+                    AsyncImage(
+                        model = imageUrl,
+                        contentDescription = favorite.displayTitle,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(favorite.aspectRatio.coerceIn(0.4f, 2.2f))
+                            .clip(RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp)),
                     )
+                } else {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(1f)
+                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Outlined.Image,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
-            }
 
-            SourceBadge(
-                label = when (favorite.source) {
-                    "pixiv" -> "P"
-                    "local" -> "本地"
-                    else -> "D"
-                },
-                modifier = Modifier.align(Alignment.TopStart).padding(6.dp),
-            )
+                SourceBadge(
+                    label = when (favorite.source) {
+                        "pixiv" -> "P"
+                        "local" -> "本地"
+                        else -> "D"
+                    },
+                    modifier = Modifier.align(Alignment.TopStart).padding(6.dp),
+                )
 
-            if (favorite.hasPrompt) {
-                Icon(
-                    Icons.Filled.Check,
-                    contentDescription = "已有提示词",
-                    tint = Color(0xFF34D399),
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(6.dp)
-                        .size(18.dp)
-                        .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(50))
-                        .padding(2.dp),
+                StatusChip(
+                    favorite = favorite,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
                 )
             }
 
-            if (favorite.hasPrompt) {
-                Row(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(6.dp)
-                        .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
-                        .clickable(onClick = onCopyPrompt)
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    Icon(
-                        Icons.Filled.ContentCopy,
-                        contentDescription = "复制提示词",
-                        tint = Color.White,
-                        modifier = Modifier.size(14.dp),
-                    )
-                    Text("复制", style = MaterialTheme.typography.labelSmall, color = Color.White)
+            // Actions, chosen per folder: only the moves the server will accept.
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                when (favorite.folder) {
+                    "original" -> {
+                        CardAction("AI", Icons.Filled.AutoAwesome, "加入待反推", onEnqueue)
+                    }
+                    "pending" -> {
+                        CardAction("直推", Icons.Filled.AutoAwesome, "交给在线 Agent", onDirectReverse)
+                        if (!favorite.isCached) {
+                            CardAction("重下", Icons.Filled.Refresh, "重新下载原图", onRetryCache)
+                        }
+                        CardAction("移除", Icons.Filled.Restore, "移回原始收藏", onRestore)
+                    }
+                    "worded" -> {
+                        CardAction("改词", Icons.Filled.Edit, "编辑提示词", onEditPrompt)
+                        CardAction("复制", Icons.Filled.ContentCopy, "复制提示词", onCopyPrompt)
+                        CardAction("归档", Icons.AutoMirrored.Filled.ArrowForward, "释放到已完成", onRelease)
+                    }
+                    else -> {
+                        CardAction("复制", Icons.Filled.ContentCopy, "复制提示词", onCopyPrompt)
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun CardAction(
+    label: String,
+    icon: ImageVector,
+    description: String,
+    onClick: () -> Unit,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+    ) {
+        Icon(
+            icon,
+            contentDescription = description,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(18.dp),
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+private val Favorite.isCached: Boolean
+    get() = cacheFile.isNotBlank() && cacheStatus == "ready"
+
+/**
+ * Shows what the card is waiting for. The pipeline has several intermediate
+ * states that look identical on the image alone, and hiding them makes the
+ * feature feel broken rather than busy.
+ */
+@Composable
+private fun StatusChip(favorite: Favorite, modifier: Modifier = Modifier) {
+    val (label, color) = when {
+        favorite.hasPrompt -> "有词" to Color(0xFF34D399)
+        favorite.reverseStatus == "processing" || favorite.reverseStatus == "direct-queued" ->
+            "处理中" to Color(0xFF60A5FA)
+        favorite.reverseStatus == "failed" -> "失败" to Color(0xFFEF4444)
+        favorite.cacheStatus == "loading" -> "下载中" to Color(0xFFFBBF24)
+        favorite.cacheStatus == "failed" || favorite.cacheError.isNotBlank() -> "缓存失败" to Color(0xFFEF4444)
+        favorite.folder == "pending" -> "待反推" to Color(0xFFFBBF24)
+        else -> return
+    }
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelSmall,
+        color = Color.White,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier
+            .background(color.copy(alpha = 0.88f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    )
 }
 
 @Composable
@@ -214,5 +341,16 @@ private fun SourceBadge(label: String, modifier: Modifier = Modifier) {
         modifier = modifier
             .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.85f), RoundedCornerShape(5.dp))
             .padding(horizontal = 5.dp, vertical = 1.dp),
+    )
+}
+
+/** Marks cards that already carry a prompt, so the archive is scannable. */
+@Composable
+private fun PromptReadyMark(modifier: Modifier = Modifier) {
+    Icon(
+        Icons.Filled.Check,
+        contentDescription = "已有提示词",
+        tint = Color(0xFF34D399),
+        modifier = modifier.size(16.dp),
     )
 }

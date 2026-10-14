@@ -1903,7 +1903,37 @@ app.get("/api/posts", async (req, res) => {
       if (response.ok || response.status < 500 || candidate === candidates.at(-1)) break;
     }
     sendUpstream(res, response, await response.text());
-  } catch (error) { res.status(502).json({error:"无法连接到图片站点", detail:error.message}); }
+  } catch (error) {
+    // Distinguish a broken proxy from an unreachable site. "fetch failed" alone
+    // sends the user looking at their network while the real cause is a dead
+    // proxy address they configured earlier.
+    //
+    // undici reports the useful code one level down, and a dual-stack failure
+    // arrives as an AggregateError whose own message is empty, so the code has
+    // to be collected from every level instead of read off the top error.
+    const codes = [error?.code, error?.cause?.code, error?.name, error?.cause?.name,
+                   ...(Array.isArray(error?.cause?.errors) ? error.cause.errors.map(e => e?.code) : [])]
+                  .filter(Boolean).map(String);
+    const has = (...want) => want.some(w => codes.includes(w));
+    const proxied = Boolean(activeProxy);
+    let message = '无法连接到图片站点';
+    let detail = error.message;
+    if (has('ECONNREFUSED') && proxied) {
+      message = `代理拒绝连接（${activeProxy}）`;
+      detail = '该地址没有服务在监听。请在设置里更正代理，或清空以直连。';
+    } else if (has('ENOTFOUND', 'EAI_AGAIN')) {
+      message = '无法解析画站域名';
+      detail = 'DNS 查询失败，通常是网络屏蔽。配置代理后重试。';
+    } else if (has('ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'TimeoutError', 'AbortError')) {
+      message = '连接画站超时';
+      detail = proxied
+        ? `经代理 ${activeProxy} 仍无法到达，请确认代理可用。`
+        : '直连超时，本站通常需要代理。请在设置 → 网络与代理里填写后重试。';
+    } else if (proxied) {
+      detail = `${error.message}（当前代理：${activeProxy}）`;
+    }
+    res.status(502).json({ error: message, detail, code: codes.join('/'), proxy: activeProxy });
+  }
 });
 function validDanbooruDate(value) {
   const date = String(value || '').trim();

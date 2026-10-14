@@ -199,6 +199,16 @@ data class ReverseQueue(
     val items: List<Favorite> = emptyList(),
 )
 
+/** A connected MCP agent, from /api/mcp/sessions. */
+@Serializable
+data class McpSession(
+    val id: String = "",
+    val name: String = "",
+    val version: String = "",
+    val since: Long = 0,
+    val seenAt: Long = 0,
+)
+
 @Serializable
 data class NetworkProbe(
     val name: String = "",
@@ -230,3 +240,30 @@ data class AppVersion(
 /** Shape of the server's error replies: {"error": "...", "detail": "..."}. */
 @Serializable
 data class ApiError(val error: String = "", val detail: String = "")
+
+/** PATCH /api/favorites/:id wraps the updated card. */
+@Serializable
+data class FavoriteDetail(val favorite: Favorite = Favorite(id = ""))
+
+/**
+ * Result of asking the server to queue a card for an online agent.
+ *
+ * The server answers 202 when it created a request, 200 when it reused an
+ * existing one, and 409 with a plain `error` when a precondition fails (card not
+ * in the pending folder, image not cached yet, or no MCP agent connected).
+ */
+@Serializable
+data class ReverseDirectResult(
+    val request: ReverseRequest? = null,
+    val item: Favorite? = null,
+)
+
+@Serializable
+data class ReverseRequest(
+    val id: String = "",
+    val itemId: String = "",
+    val status: String = "",
+    val agentName: String = "",
+    val error: String = "",
+    val createdAt: String = "",
+)
