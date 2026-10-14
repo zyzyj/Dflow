@@ -147,7 +147,8 @@ def extract(archive, dest):
             with open(target, 'wb') as f:
                 f.write(data[pos:pos + size])
             mode = read_octal(header, 100, 8)
-            if mode & 0o100:
+            # 用从 Kotlin 源码里读出的同一个掩码，而不是另写一份。
+            if mode & KOTLIN_MASK:
                 os.chmod(target, os.stat(target).st_mode | stat.S_IXUSR)
             stats['files'] += 1
 
@@ -155,6 +156,57 @@ def extract(archive, dest):
             pos += blocks
 
     return stats
+
+
+def kotlin_exec_mask():
+    """从 TarExtractor.kt 里读出实际使用的可执行位掩码。
+
+    为什么这样做：这个脚本曾经自己写了一份 0o100 的判断，而 Kotlin 里写的是
+    0b001_000_000_000（= 0o1000，sticky 位，不是可执行位）。两边不一致，脚本
+    一直绿着，真机上却一个可执行文件都没有，服务直接起不来。
+
+    复刻流程不等于复刻实现。这里改成解析真实源码，一旦 Kotlin 写错掩码，这个
+    脚本会立刻失败。
+    """
+    import re
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        '..', 'app', 'src', 'main', 'java', 'com', 'zyzyj', 'dflow',
+                        'TarExtractor.kt')
+    with open(path, encoding='utf-8') as fh:
+        src = fh.read()
+    match = re.search(r'if\s*\(\s*mode\s+and\s+([0-9A-Za-z_\.]+L?)\s*!=\s*0L', src)
+    if not match:
+        raise SystemExit('未能从 TarExtractor.kt 里找到可执行位判断；实现变了，请更新本脚本')
+    raw = match.group(1)
+    # Kotlin 的 Long 后缀 L 不是字面量的一部分。
+    literal = raw[:-1] if raw.endswith('L') else raw
+    literal = literal.replace('_', '').replace('.', '')
+    if literal.lower().startswith('0b'):
+        value = int(literal, 2)
+    elif literal.lower().startswith('0x'):
+        value = int(literal, 16)
+    else:
+        value = int(literal, 10)
+    return value, raw
+
+
+# 在解压前解析一次，并把它的值用作本脚本的判断依据。
+KOTLIN_MASK, KOTLIN_MASK_TEXT = kotlin_exec_mask()
+
+
+def audit_mask():
+    """确认 Kotlin 里的掩码真的能匹配常见的可执行权限。"""
+    problems = []
+    print(f"  Kotlin 掩码: {KOTLIN_MASK_TEXT} = 0o{KOTLIN_MASK:o}")
+    for mode, label in [(0o755, 'busybox/常规可执行'), (0o700, '仅属主可执行'),
+                        (0o555, '只读可执行'), (0o644, '普通文件')]:
+        matched = bool(mode & KOTLIN_MASK)
+        should = label != '普通文件'
+        mark = '✅' if matched == should else '❌'
+        if matched != should:
+            problems.append(f"掩码对 0o{mode:o}（{label}）判断错误")
+        print(f"    {mark} 0o{mode:o} {label:12s} → {'设可执行' if matched else '不设'}")
+    return problems
 
 
 def audit(root):
@@ -174,19 +226,48 @@ def audit(root):
                     dirlinks += 1
     print(f"  符号链接 {symlink_count} 个，其中指向目录的 {dirlinks} 个（正常，不应被复制实现破坏）")
 
+    # 关键新增：真正跟着符号链接走一遍，确认最终目标可执行。
+    # /bin/sh -> /bin/busybox，只检查 /bin/sh 本身会漏掉目标不可执行的情况。
     sh_path = os.path.join(root, 'bin', 'sh')
     if os.path.exists(sh_path) or os.path.islink(sh_path):
-        print(f"  /bin/sh 存在{'（符号链接 -> ' + os.readlink(sh_path) + '）' if os.path.islink(sh_path) else ''}")
+        resolved = os.path.realpath(sh_path)
+        if not os.path.exists(resolved):
+            problems.append(f"/bin/sh 的最终目标不存在：{resolved}")
+        elif not os.access(resolved, os.X_OK):
+            problems.append(
+                f"/bin/sh 的最终目标不可执行：{resolved} "
+                f"(mode=0o{os.stat(resolved).st_mode & 0o777:o}) — 这就是 "
+                f"proot error: '/bin/sh' is not executable 的原因")
+        else:
+            link = '（符号链接 -> ' + os.readlink(sh_path) + '）' if os.path.islink(sh_path) else ''
+            print(f"  /bin/sh 存在{link}，最终目标 {resolved} 可执行")
     else:
         problems.append("/bin/sh 缺失")
 
     node_path = os.path.join(root, 'usr', 'bin', 'node')
     if os.path.exists(node_path):
-        print(f"  /usr/bin/node 存在，{os.path.getsize(node_path) / 1048576:.1f} MB")
+        executable = os.access(node_path, os.X_OK)
+        print(f"  /usr/bin/node 存在，{os.path.getsize(node_path) / 1048576:.1f} MB，"
+              f"{'可执行' if executable else '不可执行'}")
+        if not executable:
+            problems.append("/usr/bin/node 不可执行")
     else:
         problems.append("/usr/bin/node 缺失")
 
-    # 关键：确认没有在做「复制」时走进链接而死循环（能走完就说明没有）
+    # 抽样统计：整个 rootfs 里可执行文件的比例。如果一个都没有，说明掩码又写错了。
+    total, executable = 0, 0
+    for dirpath, _, filenames in os.walk(root):
+        for n in filenames:
+            p = os.path.join(dirpath, n)
+            if os.path.islink(p) or not os.path.isfile(p):
+                continue
+            total += 1
+            if os.access(p, os.X_OK):
+                executable += 1
+    print(f"  常规文件中可执行 {executable} / {total}")
+    if total > 0 and executable == 0:
+        problems.append("没有设置任何可执行位（掩码或 setExecutable 没生效）")
+
     return problems
 
 
@@ -202,10 +283,14 @@ def main():
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest)
 
+    print("=== 可执行位掩码（从 TarExtractor.kt 读取）===")
+    problems = audit_mask()
+
+    print()
     print("=== 解压 rootfs（直接落到目标目录）===")
     stats = extract(rootfs, os.path.join(dest, 'rootfs'))
     print(f"  {stats}")
-    problems = audit(os.path.join(dest, 'rootfs'))
+    problems.extend(audit(os.path.join(dest, 'rootfs')))
 
     print()
     print("=== 解压 app（tar 内多一层 app/ 前缀）===")

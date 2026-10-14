@@ -155,11 +155,23 @@ object TarExtractor {
                     FileOutputStream(target).use { out ->
                         copyExactly(input, out, size)
                     }
-                    if (mode and 0b001_000_000_000L != 0L) {
-                        // setuid/setgid are meaningless here (no real root), but
-                        // the executable bit is essential for /bin/sh and friends.
+                    // The executable bits matter: PRoot refuses to run a /bin/sh
+                    // without them, and reports only "'/bin/sh' is not executable".
+                    //
+                    // Any of the three bits is enough — an archive may legitimately
+                    // have 0o100 (owner only, e.g. 0o700 files) and the guest runs
+                    // as a single user, so requiring the group/other bits would
+                    // skip exactly the restrictive-but-valid case.
+                    //
+                    // Note the mask is 0o111, not 0b001_000_000_000: the binary
+                    // literal used to be here and it equals 0o1000, which is the
+                    // *sticky* bit. It never matched 0o755, so no file was ever
+                    // marked executable and the server could not start at all.
+                    if (mode and 0b001_001_001L != 0L) {
                         target.setExecutable(true, false)
                     }
+                    // setuid/setgid are meaningless here (no real root) and are
+                    // deliberately dropped.
                 }
             }
 

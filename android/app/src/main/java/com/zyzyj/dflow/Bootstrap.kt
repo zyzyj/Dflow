@@ -41,9 +41,28 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         paths.stampFile.writeText(currentStamp())
     }
 
+    /**
+     * Extracts the rootfs, or returns early if this exact build already did.
+     *
+     * The marker records the stamp it was written for. It used to be a bare
+     * ".complete" file that never expired, which meant an upgrade that changed how
+     * extraction works (a permission fix, say) would never re-run: the stamp
+     * changed, install() ran, and this function skipped the rootfs because the
+     * marker from the previous version was still there. The user had to clear app
+     * data to get the fix.
+     *
+     * Re-extracting on each version bump is the intended cost: the rootfs is
+     * produced by the same pipeline as the app code, so any version change may
+     * have changed it.
+     */
     private fun installRootfs(onProgress: (Progress) -> Unit) {
         val marker = File(paths.rootfsDir, ".complete")
-        if (marker.isFile) return
+        val expected = currentStamp()
+        // Anything other than an exact match — missing, empty, or from an older
+        // build — means the tree has to be produced again.
+        if (marker.isFile && runCatching { marker.readText().trim() }.getOrNull() == expected) {
+            return
+        }
 
         // Materialise once: this copies the archive out of assets into a real file,
         // and doing it per progress tick would re-copy tens of MB repeatedly.
@@ -69,7 +88,7 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
             },
         )
 
-        marker.writeText("ok")
+        marker.writeText(expected)
         ensureGuestRuntimeFiles()
     }
 
