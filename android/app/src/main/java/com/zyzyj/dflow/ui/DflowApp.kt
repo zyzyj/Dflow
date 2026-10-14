@@ -289,10 +289,11 @@ fun DflowApp(viewModel: DflowViewModel) {
                         onRotateToken = viewModel::rotateApiToken,
                         onSaveBindScope = { bindScope ->
                             saveBindScope(context, bindScope)
-                            // Restarting is required because the guest reads the bind
-                            // address before it starts, so the change cannot apply live.
-                            NodeService.stop(context)
-                            NodeService.start(context)
+                            // The guest reads the bind address before it starts, so the
+                            // change only takes effect on a fresh launch. Restarting via
+                            // one action avoids a stop/start race that could leave no
+                            // server running.
+                            NodeService.restart(context)
                             scope.launch { snackbar.showSnackbar("已切换监听范围，正在重启服务…") }
                         },
                     )

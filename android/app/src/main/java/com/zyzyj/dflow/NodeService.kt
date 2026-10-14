@@ -57,6 +57,16 @@ class NodeService : Service() {
             return START_NOT_STICKY
         }
 
+        // Restart is handled in-process: tear the guest down, then launch again
+        // with the (re-read) bind address. Tearing down first is what makes the
+        // port free for the new listener.
+        if (intent?.action == ACTION_RESTART) {
+            appendLog("[host] restart requested (bind scope changed)")
+            stopServer()
+            scope.launch { bootstrapAndLaunch() }
+            return START_STICKY
+        }
+
         if (launcher?.isRunning == true) return START_STICKY
 
         scope.launch { bootstrapAndLaunch() }
@@ -192,6 +202,7 @@ class NodeService : Service() {
         private const val NOTIFICATION_ID = 4173
         private const val MAX_LOG_LINES = 400
         const val ACTION_STOP = "com.zyzyj.dflow.STOP"
+        const val ACTION_RESTART = "com.zyzyj.dflow.RESTART"
 
         /** Holds "local" or "lan"; read at startup by [readBindHost]. */
         const val BIND_FILE = "bind-scope.txt"
@@ -212,9 +223,33 @@ class NodeService : Service() {
         }
 
         fun stop(context: Context) {
-            context.startService(
-                Intent(context, NodeService::class.java).setAction(ACTION_STOP)
-            )
+            // startForegroundService, not startService: once the activity is in the
+            // background Android 8+ rejects a plain startService with
+            // IllegalStateException, and the user would see the bind-scope change
+            // silently fail to restart the service.
+            val intent = Intent(context, NodeService::class.java).setAction(ACTION_STOP)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        /**
+         * Stops and starts in one command.
+         *
+         * Done as a single action rather than a stop() then start() from outside,
+         * because stopSelf() is asynchronous: the follow-up start could be
+         * delivered to the instance that is still shutting down and be dropped,
+         * leaving no server running at all.
+         */
+        fun restart(context: Context) {
+            val intent = Intent(context, NodeService::class.java).setAction(ACTION_RESTART)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
     }
 }
