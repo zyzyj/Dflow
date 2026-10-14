@@ -46,16 +46,35 @@ jobs:
           base=https://packages.termux.dev/apt/termux-main/pool/main
           curl -fsSLo proot.deb  "$base/p/proot/proot_5.1.107.96_aarch64.deb"
           curl -fsSLo talloc.deb "$base/libt/libtalloc/libtalloc_2.5.0_aarch64.deb"
-          for d in proot talloc; do
+          # proot also links libandroid-shmem.so. Without it the device fails with
+          #   CANNOT LINK EXECUTABLE "libproot.so": library "libandroid-shmem.so" not found
+          # which the app can only report as "server did not become ready".
+          curl -fsSLo shmem.deb  "$base/liba/libandroid-shmem/libandroid-shmem_0.7_aarch64.deb"
+          for d in proot talloc shmem; do
             mkdir -p "x/$d"
             (cd "x/$d" && ar x "../../$d.deb" && tar xf data.tar.xz)
           done
           P=x/proot/data/data/com.termux/files/usr
           T=x/talloc/data/data/com.termux/files/usr
+          S=x/shmem/data/data/com.termux/files/usr
           cp "$P/bin/proot"             "$out/libproot.so"
           cp "$P/libexec/proot/loader"  "$out/libproot-loader.so"
           cp -L "$T/lib/libtalloc.so.2" "$out/libtalloc.so"
+          # Kept under its real soname: Android extracts lib*.so from jniLibs, and
+          # this one is needed by name at link time.
+          cp -L "$S/lib/libandroid-shmem.so" "$out/libandroid-shmem.so"
           ls -l "$out"
+
+      # Guards the dependency closure of libproot.so.
+      #
+      # The binaries are fetched by hand, so a link-time dependency that nobody
+      # packaged is invisible here and only shows up as a failed launch on a
+      # phone. libandroid-shmem.so was exactly that: it was missing for several
+      # releases and produced an unhelpful "server did not become ready".
+      - name: Verify PRoot dependencies are all packaged
+        run: |
+          set -eux
+          python3 android/tools/verify-native-deps.py android/app/src/main/jniLibs/arm64-v8a
 
       # 16 KB page-size alignment is mandatory on Android 15+ for some devices;
       # a 4 KB-aligned libproot.so fails to load with no useful error.
@@ -314,6 +333,20 @@ jobs:
             echo "::error::APK is only $size bytes; the embedded runtime is missing"
             exit 1
           fi
+
+          # Break the size down so "why is this 140 MB" has an answer in the log
+          # instead of requiring someone to unpack the APK.
+          echo
+          echo "=== 体积构成 ==="
+          echo "APK 总计: $(numfmt --to=iec "$size")"
+          unzip -l "$apk" | awk '/assets\/.*\.tar/ {printf "  %s  %s\n", $1, $4}'
+          echo "  内嵌运行环境与依赖（已压缩）:"
+          ls -la app-assets/ | awk '/\.tar\.gz/ {printf "    %s  %s\n", $5, $9}'
+          echo "  node_modules 最大的几个包（解压后）:"
+          du -sh app/app/node_modules/* 2>/dev/null | sort -rh | head -8 | sed 's/^/    /'
+          echo
+          echo "  说明：APK 安装后无需联网下载任何东西；首次启动只是把内嵌的"
+          echo "  rootfs 与 app 解压到应用私有目录（不会重复下载）。"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

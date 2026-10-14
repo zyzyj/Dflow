@@ -82,7 +82,19 @@ class NodeService : Service() {
                 notify("正在解压运行环境…")
                 bootstrap.install { progress ->
                     val mb = progress.bytes / (1024.0 * 1024.0)
-                    if (mb > 0) notify("${progress.phase}  ${"%.1f".format(mb)} MB")
+                    if (mb > 0) {
+                        // Say what is happening and roughly how far along. A bare MB
+                        // counter reads like a download and invites the question
+                        // "why is it downloading 140 MB when I already installed the
+                        // app" — it is unpacking what was already inside the APK.
+                        val percent = progress.totalBytes?.takeIf { it > 0 }?.let {
+                            (progress.bytes * 100 / it).coerceIn(0, 100)
+                        }
+                        notify(
+                            if (percent != null) "${progress.phase}（本地解压）$percent%"
+                            else "${progress.phase}（本地解压）${"%.0f".format(mb)} MB"
+                        )
+                    }
                 }
             }
             _state.value = State.Bootstrapping
@@ -103,8 +115,13 @@ class NodeService : Service() {
                 _state.value = State.Ready
                 notify("DFlow 正在运行（127.0.0.1:$PORT）")
             } else {
-                appendLog("[host] server did not become ready in time")
-                _state.value = State.Failed("服务未能在超时前启动，请查看日志")
+                // Use the launcher's diagnosis: "exited immediately" (bad
+                // environment) and "never listened" (too slow) need different
+                // responses from the user, and both used to read as
+                // "未能在超时前启动".
+                val reason = server.failureReason()
+                appendLog("[host] 启动失败：$reason")
+                _state.value = State.Failed(reason)
                 notify("服务启动失败")
             }
         } catch (error: Throwable) {
@@ -140,9 +157,29 @@ class NodeService : Service() {
     // ---- logging -----------------------------------------------------------
 
     private val logs = ArrayDeque<String>()
+    /** 上一行原文，用于合并连续重复输出。 */
+    private var lastLine = ""
+    private var repeatCount = 0
 
     @Synchronized
     private fun appendLog(line: String) {
+        // The launcher retries and the guest repeats itself verbatim, so one error
+        // can fill the whole buffer and push out the lines that differ — in the
+        // field that turned a linker failure into a screen of identical text.
+        // Consecutive duplicates are collapsed to a single line plus a count.
+        if (line == lastLine) {
+            repeatCount += 1
+            if (logs.isNotEmpty()) {
+                logs.removeLast()
+                logs.addLast(if (repeatCount == 2) line else "$line    （重复 $repeatCount 次）")
+                _log.value = logs.joinToString("\n")
+            }
+            LogStore.append("node", line)
+            return
+        }
+
+        lastLine = line
+        repeatCount = 1
         logs.addLast(line)
         while (logs.size > MAX_LOG_LINES) logs.removeFirst()
         _log.value = logs.joinToString("\n")
@@ -200,7 +237,7 @@ class NodeService : Service() {
         const val PORT = 4173
         private const val CHANNEL_ID = "dflow-node"
         private const val NOTIFICATION_ID = 4173
-        private const val MAX_LOG_LINES = 400
+        private const val MAX_LOG_LINES = 2000
         const val ACTION_STOP = "com.zyzyj.dflow.STOP"
         const val ACTION_RESTART = "com.zyzyj.dflow.RESTART"
 

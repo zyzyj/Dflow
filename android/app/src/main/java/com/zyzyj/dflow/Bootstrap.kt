@@ -15,7 +15,7 @@ import java.io.IOException
  */
 class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
 
-    data class Progress(val phase: String, val bytes: Long)
+    data class Progress(val phase: String, val bytes: Long, val totalBytes: Long = 0)
 
     fun isInstalled(): Boolean {
         if (!paths.stampFile.isFile) return false
@@ -45,7 +45,11 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         val marker = File(paths.rootfsDir, ".complete")
         if (marker.isFile) return
 
-        onProgress(Progress("正在解压运行环境", 0))
+        // Materialise once: this copies the archive out of assets into a real file,
+        // and doing it per progress tick would re-copy tens of MB repeatedly.
+        val archive = materialiseAsset(ASSET_ROOTFS)
+        val total = archive.length()
+        onProgress(Progress("正在解压运行环境（本地，不联网）", 0, total))
         // Start from a clean tree: a half-extracted rootfs must never be reused.
         paths.rootfsDir.deleteRecursively()
         paths.rootfsDir.mkdirs()
@@ -58,9 +62,11 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         // etc/mtab -> ../proc/mounts failed outright. The tar itself is the
         // atomic unit here, not the directory copy.
         TarExtractor.extractArchive(
-            archive = materialiseAsset(ASSET_ROOTFS),
+            archive = archive,
             destination = paths.rootfsDir,
-            onProgress = { bytes -> onProgress(Progress("正在解压运行环境", bytes)) },
+            onProgress = { bytes ->
+                onProgress(Progress("正在解压运行环境（本地，不联网）", bytes, total))
+            },
         )
 
         marker.writeText("ok")
@@ -68,7 +74,9 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
     }
 
     private fun installAppTree(onProgress: (Progress) -> Unit) {
-        onProgress(Progress("正在安装应用文件", 0))
+        val archive = materialiseAsset(ASSET_APP)
+        val total = archive.length()
+        onProgress(Progress("正在安装应用文件（本地，不联网）", 0, total))
 
         // The archive is rooted at app/, so it lands in its own directory; the
         // app tree is then assembled by moving children into place rather than
@@ -78,9 +86,11 @@ class Bootstrap(private val context: Context, private val paths: RuntimePaths) {
         staged.mkdirs()
 
         TarExtractor.extractArchive(
-            archive = materialiseAsset(ASSET_APP),
+            archive = archive,
             destination = staged,
-            onProgress = { bytes -> onProgress(Progress("正在安装应用文件", bytes)) },
+            onProgress = { bytes ->
+                onProgress(Progress("正在安装应用文件（本地，不联网）", bytes, total))
+            },
         )
 
         // The tar is rooted at "app/", so prefer that nested directory.

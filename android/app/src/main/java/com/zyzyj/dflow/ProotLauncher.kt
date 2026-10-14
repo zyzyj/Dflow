@@ -62,18 +62,50 @@ class ProotLauncher(
     val isRunning: Boolean
         get() = process?.isAlive == true
 
-    /** Prepares the talloc shim and tmp dirs that PRoot expects to find. */
+    /**
+     * Prepares the shared libraries PRoot needs at link time.
+     *
+     * Android extracts only `lib*.so` from jniLibs, and it keeps the file name
+     * rather than the soname the binary was linked against. PRoot asks for
+     * `libtalloc.so.2`, which is not a valid extracted name, so a copy is made
+     * under the expected soname and LD_LIBRARY_PATH points at the directory
+     * holding it. Patching the ELF instead would break on every proot update.
+     *
+     * libandroid-shmem.so was missing entirely for several releases: proot links
+     * it, and without it the kernel refuses to start the process with
+     *   CANNOT LINK EXECUTABLE "libproot.so": library "libandroid-shmem.so" not found
+     * which the app could only surface as "server did not become ready".
+     */
     private fun prepareSupportFiles() {
         paths.prootTmpDir.mkdirs()
         paths.prootLibDir.mkdirs()
-        // The Termux PRoot build declares DT_NEEDED libtalloc.so.2, but Android
-        // jniLibs only preserves the name libtalloc.so. Bind a copy under the
-        // expected soname and point LD_LIBRARY_PATH at it, rather than patching
-        // the ELF binary.
-        val source = File(paths.nativeLibDir, "libtalloc.so")
-        val target = File(paths.prootLibDir, "libtalloc.so.2")
-        if (source.isFile && (!target.isFile || target.length() != source.length())) {
-            source.copyTo(target, overwrite = true)
+
+        /** Copies [name] from jniLibs into the shim dir under [soname]. */
+        fun linkLibrary(name: String, soname: String = name) {
+            val source = File(paths.nativeLibDir, name)
+            val target = File(paths.prootLibDir, soname)
+            // Skip when already identical: comparing length is enough here since
+            // the file is written by the same build, and copying on every launch
+            // would be wasted work.
+            if (source.isFile && (!target.isFile || target.length() != source.length())) {
+                source.copyTo(target, overwrite = true)
+            }
+        }
+
+        linkLibrary("libtalloc.so", "libtalloc.so.2")
+        // Already named correctly, but staged into the same directory so a single
+        // LD_LIBRARY_PATH entry resolves it.
+        linkLibrary("libandroid-shmem.so")
+
+        // Fail loudly here rather than letting the kernel refuse to exec proot and
+        // reporting only "library not found" from the linker. A missing file at
+        // this point means the APK was built without it, which is a packaging bug
+        // worth naming precisely.
+        val required = listOf("libtalloc.so.2", "libandroid-shmem.so")
+        val missing = required.filterNot { File(paths.prootLibDir, it).isFile }
+        if (missing.isNotEmpty()) {
+            onLog("[host] 缺少 PRoot 依赖库：${missing.joinToString(", ")}")
+            onLog("[host] 这是安装包缺少原生库，请安装最新版本")
         }
     }
 
@@ -118,8 +150,15 @@ class ProotLauncher(
         put("DFLOW_LOG_DIR", "/root/dflow-data/logs")
     }
 
-    /** Starts the guest and blocks (off the main thread) until the port answers. */
-    fun startAndAwait(timeoutMs: Long = 120_000): Boolean {
+    /**
+     * Starts the guest and blocks (off the main thread) until the port answers.
+     *
+     * [timeoutMs] is generous because PRoot path-translation makes module loading
+     * slow, and the first run also populates the Node compile cache. On a slow
+     * device with a large node_modules this can take minutes, and a timeout that
+     * is too short looks exactly like a real failure.
+     */
+    fun startAndAwait(timeoutMs: Long = 300_000): Boolean {
         if (isRunning) return true
         prepareSupportFiles()
 
@@ -155,24 +194,62 @@ class ProotLauncher(
         outputThreads += thread
     }
 
-    /** Polls the port instead of sleeping a guessed amount of time. */
+    /**
+     * Polls the port instead of sleeping a guessed amount of time.
+     *
+     * Returns a structured outcome rather than a bare boolean, because "the
+     * process died immediately" and "the process is alive but never listened" are
+     * different problems with different causes, and the previous boolean made them
+     * indistinguishable in the UI.
+     */
     private fun awaitPort(timeoutMs: Long): Boolean {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
             if (process?.isAlive != true) {
-                onLog("[host] PRoot exited before the server became ready")
+                // Exiting here means the guest failed at startup — a missing
+                // library, a bad binary, or an unreadable rootfs. Distinguishing
+                // it from a timeout is what lets the UI say something useful.
+                exitReason = ExitReason.ExitedEarly(process?.exitValue())
+                onLog("[host] PRoot 在就绪前退出（退出码 ${process?.exitValue()}）")
                 return false
             }
             try {
                 Socket().use { socket ->
                     socket.connect(InetSocketAddress("127.0.0.1", port), 300)
+                    exitReason = null
                     return true
                 }
             } catch (_: Throwable) {
                 SystemClock.sleep(200)
             }
         }
+        exitReason = ExitReason.TimedOut
+        onLog("[host] 已等待 ${timeoutMs / 1000} 秒仍未见端口监听")
         return false
+    }
+
+    /** Why the last start failed; null when it succeeded or never ran. */
+    var exitReason: ExitReason? = null
+        private set
+
+    sealed interface ExitReason {
+        /** Guest exited before listening. [code] is the process exit status. */
+        data class ExitedEarly(val code: Int?) : ExitReason
+        /** Guest is still alive but never bound the port within the deadline. */
+        data object TimedOut : ExitReason
+    }
+
+    /** Human-readable explanation of the last failure, for the UI. */
+    fun failureReason(): String = when (val reason = exitReason) {
+        is ExitReason.ExitedEarly -> when (reason.code) {
+            // 127 is what a shell returns for a binary it could not execute; the
+            // linker's own message is in the log.
+            127 -> "运行环境无法启动（找不到可执行文件或缺少依赖库）"
+            139 -> "运行环境崩溃（段错误）"
+            else -> "运行环境在启动过程中退出（退出码 ${reason.code ?: "未知"}）"
+        }
+        ExitReason.TimedOut -> "服务在超时前没有就绪，请查看日志"
+        null -> "服务未能启动"
     }
 
     /**
