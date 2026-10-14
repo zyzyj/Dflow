@@ -25,6 +25,9 @@ jobs:
   build:
     name: Build DFlow APK (PRoot + Node)
     runs-on: ubuntu-latest
+    # Needed so the last step can create a release to host the APK.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -224,3 +227,21 @@ jobs:
           name: DFlow-APK
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      # Artifact downloads go through pipelines.actions.githubusercontent.com,
+      # which is unreachable from some networks. A release asset is served from
+      # github.com itself, so publishing one gives a link that always works and
+      # can be opened directly on the phone.
+      - name: Publish APK to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          tag="apk-$(date -u +%Y%m%d-%H%M%S)"
+          apk=$(find android/app/build/outputs/apk/debug -name '*.apk' | head -1)
+          notes=$'自动构建的调试包。\n\n内含 PRoot + Alpine + Node 22 与预装的 node_modules，\n因此体积约 50 MB 属正常（纯静态的壳是 3.8 MB）。'
+          gh release create "$tag" "$apk" \
+            --title "DFlow APK $tag" \
+            --notes "$notes" \
+            --prerelease
+          echo "已发布：$tag"
