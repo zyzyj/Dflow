@@ -1,52 +1,72 @@
 package com.zyzyj.dflow
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.view.View
-import android.webkit.WebChromeClient
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ProgressBar
-import android.widget.ScrollView
-import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.zyzyj.dflow.data.DflowApi
+import com.zyzyj.dflow.ui.DflowApp
+import com.zyzyj.dflow.ui.DflowViewModel
+import com.zyzyj.dflow.ui.theme.DflowTheme
 
 /**
- * Shows the DFlow web UI served by the embedded Node process.
+ * Entry point.
  *
- * The WebView loads http://127.0.0.1:PORT rather than a bundled file, because
- * the front end is a thin client over the Node API (dozens of endpoint calls
- * for the gallery, favourites, reverse-prompt queue and translation). Serving
- * the same files from the filesystem would leave every one of those calls
- * failing.
+ * The first launch has to unpack ~140 MB of Linux userland before any screen can
+ * work, so the activity shows a real progress screen for that phase and hands
+ * over to the Compose UI once the embedded server answers.
  */
 class MainActivity : ComponentActivity() {
 
-    private lateinit var webView: WebView
-    private lateinit var splash: LinearLayout
-    private lateinit var statusText: TextView
-    private lateinit var logText: TextView
-    private lateinit var retryButton: Button
-    private lateinit var progress: ProgressBar
+    /** Created once per activity, not per recomposition, so gallery state and
+     *  the in-flight coroutines survive screen switches. */
+    private val viewModel: DflowViewModel by lazy {
+        DflowViewModel(DflowApi(NodeService.PORT))
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestNotificationPermission()
-        buildViews()
-        // Start the server as soon as the activity exists so the two run in
-        // parallel; the splash explains the wait instead of showing a blank page.
         NodeService.start(this)
-        observeService()
+
+        setContent {
+            DflowTheme {
+                Surface(color = MaterialTheme.colorScheme.background) {
+                    Root()
+                }
+            }
+        }
     }
 
     private fun requestNotificationPermission() {
@@ -57,114 +77,83 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun buildViews() {
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+    @Composable
+    private fun Root() {
+        val serviceState by NodeService.state.collectAsState()
+        val logs by NodeService.log.collectAsState()
 
-        splash = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 96, 48, 48)
-        }
+        when (serviceState) {
+            is NodeService.State.Ready -> DflowApp(viewModel)
 
-        val title = TextView(this).apply {
-            text = "DFlow"
-            textSize = 26f
+            is NodeService.State.Failed -> StatusScreen(
+                title = "启动失败",
+                detail = (serviceState as NodeService.State.Failed).reason,
+                logs = logs,
+                onRetry = { NodeService.start(this@MainActivity) },
+            )
+
+            NodeService.State.Stopped -> StatusScreen(
+                title = "正在启动本地服务…",
+                detail = "",
+                logs = logs,
+                onRetry = { NodeService.start(this@MainActivity) },
+            )
+
+            NodeService.State.Bootstrapping -> StatusScreen(
+                title = "正在准备运行环境…",
+                detail = "首次启动需要解压约 140 MB，请稍候",
+                logs = logs,
+                onRetry = null,
+            )
         }
-        statusText = TextView(this).apply {
-            text = "正在启动本地服务…"
-            textSize = 15f
-            setPadding(0, 24, 0, 16)
+    }
+}
+
+@Composable
+private fun StatusScreen(
+    title: String,
+    detail: String,
+    logs: String,
+    onRetry: (() -> Unit)?,
+) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(title, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
+        if (detail.isNotBlank()) {
+            Text(
+                detail,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 10.dp),
+            )
         }
-        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            isIndeterminate = true
-        }
-        retryButton = Button(this).apply {
-            text = "重新启动服务"
-            visibility = View.GONE
-            setOnClickListener {
-                retryButton.visibility = View.GONE
-                statusText.text = "正在重新启动…"
-                NodeService.start(this@MainActivity)
+        if (onRetry != null) {
+            Button(onClick = onRetry, modifier = Modifier.padding(top = 20.dp)) {
+                Text("重试")
             }
-        }
-        val logScroll = ScrollView(this).apply {
-            setPadding(0, 32, 0, 0)
-        }
-        logText = TextView(this).apply {
-            textSize = 11f
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        logScroll.addView(logText)
-
-        splash.addView(title)
-        splash.addView(statusText)
-        splash.addView(progress)
-        splash.addView(retryButton)
-        splash.addView(logScroll)
-
-        webView = WebView(this).apply {
-            visibility = View.GONE
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true          // the front end keeps state in localStorage
-            settings.allowFileAccess = false
-            settings.mediaPlaybackRequiresUserGesture = false
-            webViewClient = WebViewClient()
-            webChromeClient = WebChromeClient()
-        }
-
-        root.addView(splash, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT)
-        root.addView(webView, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT)
-        setContentView(root)
-    }
-
-    private fun observeService() {
-        lifecycleScope.launch {
-            NodeService.state.collect { state ->
-                when (state) {
-                    is NodeService.State.Ready -> showWebView()
-                    is NodeService.State.Failed -> {
-                        statusText.text = state.reason
-                        progress.visibility = View.GONE
-                        retryButton.visibility = View.VISIBLE
-                    }
-                    NodeService.State.Bootstrapping -> {
-                        statusText.text = "正在启动本地服务…"
-                        progress.visibility = View.VISIBLE
-                    }
-                    NodeService.State.Stopped -> statusText.text = "服务已停止"
-                }
-            }
-        }
-        lifecycleScope.launch {
-            NodeService.log.collect { text ->
-                logText.text = text
-                // Follow the tail so the newest line stays visible during a slow start.
-                statusText.text = text.lineSequence().lastOrNull()?.take(120) ?: statusText.text
-            }
-        }
-    }
-
-    private fun showWebView() {
-        if (webView.visibility == View.VISIBLE) return
-        splash.visibility = View.GONE
-        webView.visibility = View.VISIBLE
-        webView.loadUrl("http://127.0.0.1:${NodeService.PORT}/")
-    }
-
-    override fun onResume() {
-        super.onResume()
-        // Coming back after a kill: if the server is ready but we are still on
-        // the splash, go straight to the UI.
-        if (NodeService.state.value is NodeService.State.Ready) showWebView()
-    }
-
-    @SuppressLint("GestureBackNavigation")
-    @Deprecated("Handled for the in-page history; the API is required on older WebView.")
-    override fun onBackPressed() {
-        if (webView.visibility == View.VISIBLE && webView.canGoBack()) {
-            webView.goBack()
         } else {
-            @Suppress("DEPRECATION")
-            super.onBackPressed()
+            Box(Modifier.padding(top = 24.dp)) {
+                CircularProgressIndicator()
+            }
+        }
+
+        // The log is the only way to see what the sandbox is doing; a silent
+        // spinner would leave a stuck launch undiagnosable.
+        if (logs.isNotBlank()) {
+            Text(
+                text = logs.takeLast(3000),
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 24.dp)
+                    .verticalScroll(rememberScrollState()),
+            )
         }
     }
 }

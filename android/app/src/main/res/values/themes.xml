@@ -1,9 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Dark theme to match the web UI, which is designed for a dark background. -->
-    <style name="Theme.DFlow" parent="Theme.AppCompat.NoActionBar">
+    <!--
+      The UI is Compose and carries its own Material You color scheme, so this
+      theme only needs to cover the window before the first frame is drawn.
+      Parenting it to the platform theme keeps the launch screen consistent with
+      the system; the Compose surface paints over it immediately.
+    -->
+    <style name="Theme.DFlow" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/background</item>
-        <item name="android:statusBarColor">@color/background</item>
-        <item name="android:navigationBarColor">@color/background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

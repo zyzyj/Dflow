@@ -1,6 +1,8 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("org.jetbrains.kotlin.plugin.serialization")
 }
 
 android {
@@ -11,8 +13,8 @@ android {
         applicationId = "com.zyzyj.dflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.3.8-test1"
+        versionCode = 3
+        versionName = "0.3.9-test2"
 
         // The APK ships a self-contained Linux userland (proot + Alpine rootfs +
         // node_modules), so it only makes sense on 64-bit ARM. Shipping other
@@ -39,6 +41,7 @@ android {
     }
 
     buildFeatures {
+        compose = true
         // BuildConfig carries the versionCode used to decide whether the
         // bundled rootfs needs reinstalling after an upgrade.
         buildConfig = true
@@ -74,8 +77,27 @@ android {
 }
 
 dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+    implementation(composeBom)
+
     implementation("androidx.core:core-ktx:1.15.0")
-    implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.activity:activity-ktx:1.9.3")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.navigation:navigation-compose:2.8.5")
+
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material3:material3-window-size-class")
+    implementation("androidx.compose.material:material-icons-extended")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // Networking and images. Coil fetches through DFlow's own image proxy,
+    // because the CDN requires headers a plain client does not send.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 }

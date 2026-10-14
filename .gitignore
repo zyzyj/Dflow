@@ -1,8 +1,11 @@
 # Dependencies
 node_modules/
 
-# Runtime and Local User Data
-data/
+# Runtime and Local User Data.
+# Anchored to the repository root: an unanchored "/data/" would also match
+# Android source packages such as .../com/zyzyj/dflow/data/, silently dropping
+# them from the build.
+/data/
 
 # OS & Editor
 .DS_Store
